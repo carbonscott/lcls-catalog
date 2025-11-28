@@ -336,6 +336,22 @@ class ParquetCatalog:
         result = self._query(sql)
         return result[0][0] if result else 0
 
+    def query(self, sql: str) -> list[tuple]:
+        """
+        Execute a raw SQL query on the catalog.
+
+        Args:
+            sql: SQL query string. Use 'files' as the table name.
+
+        Returns:
+            List of result tuples.
+        """
+        pattern = self._get_parquet_pattern()
+        # Replace 'files' table reference with parquet glob pattern
+        sql = sql.replace("files", f"'{pattern}'")
+        sql = sql.replace("FILES", f"'{pattern}'")
+        return duckdb.execute(sql).fetchall()
+
     def close(self):
         """No-op for API compatibility with Catalog."""
         pass

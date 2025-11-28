@@ -335,3 +335,17 @@ class Catalog:
         cursor = self.conn.cursor()
         cursor.execute("SELECT COALESCE(SUM(size), 0) FROM files")
         return cursor.fetchone()[0]
+
+    def query(self, sql: str) -> list[tuple]:
+        """
+        Execute a raw SQL query on the catalog.
+
+        Args:
+            sql: SQL query string. Use 'files' as the table name.
+
+        Returns:
+            List of result tuples.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(sql)
+        return cursor.fetchall()

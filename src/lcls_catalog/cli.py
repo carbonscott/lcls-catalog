@@ -138,6 +138,17 @@ def cmd_stats(args):
         print(f"Total size:  {size_str}")
 
 
+def cmd_query(args):
+    """Handle the query command."""
+    with get_catalog(args.db) as cat:
+        rows = cat.query(args.sql)
+        if not rows:
+            print("No results")
+            return
+        for row in rows:
+            print("\t".join(str(x) if x is not None else "" for x in row))
+
+
 def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
@@ -212,6 +223,14 @@ def main():
     stats_parser = subparsers.add_parser("stats", help="Show catalog statistics")
     stats_parser.add_argument("db", help="Catalog database file or directory")
     stats_parser.set_defaults(func=cmd_stats)
+
+    # query command
+    query_parser = subparsers.add_parser(
+        "query", help="Run raw SQL query (use 'files' as table name)"
+    )
+    query_parser.add_argument("db", help="Catalog database file or directory")
+    query_parser.add_argument("sql", help="SQL query (use 'files' as table name)")
+    query_parser.set_defaults(func=cmd_query)
 
     args = parser.parse_args()
     args.func(args)
