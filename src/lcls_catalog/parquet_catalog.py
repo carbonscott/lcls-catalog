@@ -248,21 +248,26 @@ class ParquetCatalog:
         size_gt: Optional[int] = None,
         size_lt: Optional[int] = None,
         experiment: Optional[str] = None,
+        exclude: Optional[list[str]] = None,
     ) -> list[FileEntry]:
         """
         Search for files matching a pattern.
 
         Args:
-            pattern: SQL LIKE pattern for filename (e.g., "%.h5", "image_%").
+            pattern: SQL LIKE pattern for path (e.g., "%.h5", "%mfx%").
             size_gt: Minimum file size in bytes.
             size_lt: Maximum file size in bytes.
             experiment: Filter by experiment ID.
+            exclude: List of patterns to exclude (NOT LIKE).
 
         Returns:
             List of matching FileEntry objects.
         """
         conditions = [f"path LIKE '{pattern}'"]
 
+        if exclude:
+            for exc in exclude:
+                conditions.append(f"path NOT LIKE '{exc}'")
         if size_gt is not None:
             conditions.append(f"size > {size_gt}")
         if size_lt is not None:

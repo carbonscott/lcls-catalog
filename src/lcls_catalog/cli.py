@@ -102,6 +102,7 @@ def cmd_find(args):
             size_gt=size_gt,
             size_lt=size_lt,
             experiment=args.experiment,
+            exclude=args.exclude if args.exclude else None,
         )
         if not results:
             print(f"No files matching '{args.pattern}'")
@@ -192,6 +193,10 @@ def main():
     find_parser.add_argument("--size-gt", help="Minimum size (e.g., 1GB, 500MB)")
     find_parser.add_argument("--size-lt", help="Maximum size (e.g., 1GB, 500MB)")
     find_parser.add_argument("-e", "--experiment", help="Filter by experiment")
+    find_parser.add_argument(
+        "--exclude", action="append", default=[],
+        help="Exclude paths matching pattern (can be repeated)"
+    )
     find_parser.set_defaults(func=cmd_find)
 
     # tree command
