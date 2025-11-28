@@ -42,11 +42,11 @@ class TestSnapshot:
             )
 
             # Check a specific file
-            results = cat.find("image_0001.h5")
+            results = cat.find("%/image_0001.h5")
             assert len(results) == 1
             assert results[0].size == 1024
 
-            results = cat.find("image_0002.h5")
+            results = cat.find("%/image_0002.h5")
             assert len(results) == 1
             assert results[0].size == 2048
 
@@ -58,7 +58,7 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("metadata.json")
+            results = cat.find("%/metadata.json")
             assert len(results) == 1
             assert "run0001" in results[0].path
             assert results[0].filename == "metadata.json"
@@ -71,7 +71,7 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("image_0001.h5")
+            results = cat.find("%/image_0001.h5")
             assert len(results) == 1
             assert results[0].parent_path.endswith("run0001")
 
@@ -83,7 +83,7 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("analysis.npz")
+            results = cat.find("%/analysis.npz")
             assert len(results) == 1
             assert results[0].mtime is not None
             assert results[0].mtime > 0
@@ -96,7 +96,7 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("calibration.dat")
+            results = cat.find("%/calibration.dat")
             assert len(results) == 1
             assert results[0].permissions is not None
 
@@ -108,11 +108,11 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("image_0001.h5")
+            results = cat.find("%/image_0001.h5")
             assert len(results) == 1
             assert results[0].run == 1
 
-            results = cat.find("data.h5")
+            results = cat.find("%/data.h5")
             assert len(results) == 1
             assert results[0].run == 2
 
@@ -124,7 +124,7 @@ class TestSnapshot:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("image_0001.h5")
+            results = cat.find("%/image_0001.h5")
             assert len(results) == 1
             assert results[0].experiment == fake_experiment.experiment
 
@@ -137,7 +137,7 @@ class TestSnapshot:
                 compute_checksum=True,
             )
 
-            results = cat.find("metadata.json")
+            results = cat.find("%/metadata.json")
             assert len(results) == 1
             assert results[0].checksum is not None
             assert len(results[0].checksum) == 64  # SHA-256 hex digest
@@ -151,7 +151,7 @@ class TestSnapshot:
                 compute_checksum=False,
             )
 
-            results = cat.find("metadata.json")
+            results = cat.find("%/metadata.json")
             assert len(results) == 1
             assert results[0].checksum is None
 
@@ -164,6 +164,6 @@ class TestSnapshot:
                 purge_date="2024-06-01",
             )
 
-            results = cat.find("image_0001.h5")
+            results = cat.find("%/image_0001.h5")
             assert len(results) == 1
             assert results[0].purge_date == "2024-06-01"

@@ -146,7 +146,7 @@ class TestFind:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("analysis.npz")
+            results = cat.find("%/analysis.npz")
             assert len(results) == 1
             assert results[0].filename == "analysis.npz"
 
@@ -158,7 +158,7 @@ class TestFind:
                 experiment=fake_experiment.experiment,
             )
 
-            results = cat.find("image_%")
+            results = cat.find("%/image_%")
             assert len(results) == 2
 
             results = cat.find("%.h5")

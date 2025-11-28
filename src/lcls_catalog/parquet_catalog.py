@@ -261,7 +261,7 @@ class ParquetCatalog:
         Returns:
             List of matching FileEntry objects.
         """
-        conditions = [f"filename LIKE '{pattern}'"]
+        conditions = [f"path LIKE '{pattern}'"]
 
         if size_gt is not None:
             conditions.append(f"size > {size_gt}")

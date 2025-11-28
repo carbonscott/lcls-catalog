@@ -61,7 +61,7 @@ class TestDeepNesting:
                 experiment=deep_nested_structure.experiment,
             )
 
-            results = cat.find("deep_file.txt")
+            results = cat.find("%/deep_file.txt")
             assert len(results) == 1
 
             # Should contain all 12 levels
@@ -77,7 +77,7 @@ class TestDeepNesting:
                 experiment=deep_nested_structure.experiment,
             )
 
-            results = cat.find("deep_file.txt")
+            results = cat.find("%/deep_file.txt")
             assert len(results) == 1
 
             parent = results[0].parent_path
@@ -95,7 +95,7 @@ class TestSpecialCharacters:
                 experiment=special_chars_structure.experiment,
             )
 
-            results = cat.find("file with spaces.txt")
+            results = cat.find("%/file with spaces.txt")
             assert len(results) == 1
             assert results[0].size == 32
 
@@ -118,7 +118,7 @@ class TestSpecialCharacters:
                 experiment=special_chars_structure.experiment,
             )
 
-            results = cat.find(".hidden%")
+            results = cat.find("%/.hidden%")
             assert len(results) == 1
             assert results[0].filename == ".hidden_config"
 
@@ -148,7 +148,7 @@ class TestSymlinks:
             )
 
             # Should still have cataloged the real file
-            results = cat.find("original.dat")
+            results = cat.find("%/original.dat")
             assert len(results) == 1
 
 
@@ -171,7 +171,7 @@ class TestLargeValues:
             )
             cat.conn.commit()
 
-            results = cat.find("large_file.dat")
+            results = cat.find("%/large_file.dat")
             assert len(results) == 1
             assert results[0].size == large_size
 

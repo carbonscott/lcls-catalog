@@ -73,7 +73,7 @@ class TestParquetSnapshot:
                 compute_checksum=True,
             )
 
-            results = cat.find("metadata.json")
+            results = cat.find("%/metadata.json")
             assert len(results) == 1
             assert results[0].checksum is not None
             assert len(results[0].checksum) == 64
@@ -168,7 +168,7 @@ class TestParquetEdgeCases:
             )
             assert count == 1
 
-            results = cat.find("deep_file.txt")
+            results = cat.find("%/deep_file.txt")
             assert len(results) == 1
 
     def test_special_characters(self, special_chars_structure, parquet_catalog_dir):

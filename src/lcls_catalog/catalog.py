@@ -261,7 +261,7 @@ class Catalog:
             SELECT path, parent_path, filename, size, mtime, owner, group_name,
                    permissions, checksum, archive_uri, experiment, run, purge_date
             FROM files
-            WHERE filename LIKE ?
+            WHERE path LIKE ?
         """
         params: list = [pattern]
 
