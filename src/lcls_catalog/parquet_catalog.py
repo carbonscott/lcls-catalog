@@ -1,9 +1,10 @@
-"""Parquet-based catalog with parallel write support."""
+"""Parquet-based catalog with incremental delta updates."""
 
 import hashlib
 import os
+import re
+import shutil
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,7 +18,7 @@ from .catalog import DirSummary, FileEntry
 
 def _process_file(args: tuple) -> Optional[dict]:
     """Process a single file and return its metadata. Runs in worker process."""
-    fpath_str, compute_checksum, experiment, purge_date = args
+    fpath_str, compute_checksum, experiment, indexed_at = args
     fpath = Path(fpath_str)
 
     try:
@@ -32,7 +33,6 @@ def _process_file(args: tuple) -> Optional[dict]:
             checksum = sha256.hexdigest()
 
         # Extract run number
-        import re
         match = re.search(r"run(\d+)", fpath_str)
         run = int(match.group(1)) if match else None
 
@@ -46,18 +46,20 @@ def _process_file(args: tuple) -> Optional[dict]:
             "group_name": str(stat.st_gid),
             "permissions": stat.st_mode,
             "checksum": checksum,
-            "archive_uri": None,
             "experiment": experiment,
             "run": run,
-            "purge_date": purge_date,
+            "indexed_at": indexed_at,
         }
     except (OSError, PermissionError):
         return None
 
 
 class ParquetCatalog:
-    """A catalog using Parquet files with DuckDB for queries."""
+    """A catalog using Parquet files with base + delta incremental updates."""
 
+    # Unified schema for both base and delta files
+    # Base files: on_disk is set, status is NULL
+    # Delta files: status is set, on_disk is NULL
     SCHEMA = pa.schema([
         ("path", pa.string()),
         ("parent_path", pa.string()),
@@ -68,10 +70,11 @@ class ParquetCatalog:
         ("group_name", pa.string()),
         ("permissions", pa.int32()),
         ("checksum", pa.string()),
-        ("archive_uri", pa.string()),
         ("experiment", pa.string()),
         ("run", pa.int32()),
-        ("purge_date", pa.string()),
+        ("indexed_at", pa.string()),
+        ("on_disk", pa.bool_()),     # Set in base files, NULL in deltas
+        ("status", pa.string()),      # Set in delta files ("added"/"modified"/"removed"), NULL in base
     ])
 
     def __init__(self, catalog_dir: str):
@@ -84,88 +87,200 @@ class ParquetCatalog:
         self.catalog_dir = Path(catalog_dir)
         self.catalog_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_parquet_pattern(self) -> str:
-        """Get glob pattern for all Parquet files."""
-        return str(self.catalog_dir / "*.parquet")
-
-    def _get_parquet_path(self, purge_date: str, root: str) -> Path:
-        """Get path for a specific snapshot's Parquet file."""
-        # Use hash of root path for unique filenames
+    def _get_exp_dir(self, root: str) -> Path:
+        """Get directory for a specific experiment based on root path hash."""
         path_hash = hashlib.md5(root.encode()).hexdigest()[:8]
-        return self.catalog_dir / f"{path_hash}_{purge_date}.parquet"
+        exp_dir = self.catalog_dir / path_hash
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        return exp_dir
+
+    def _find_latest_base(self, exp_dir: Path) -> Optional[Path]:
+        """Find the most recent base file in an experiment directory."""
+        base_files = sorted(exp_dir.glob("base_*.parquet"))
+        return base_files[-1] if base_files else None
+
+    def _find_deltas_after_base(self, exp_dir: Path, base_file: Optional[Path]) -> list[Path]:
+        """Find all delta files created after the given base file."""
+        if not base_file:
+            return []
+        base_name = base_file.name
+        delta_files = sorted(exp_dir.glob("delta_*.parquet"))
+        return [d for d in delta_files if d.name > base_name.replace("base_", "delta_")]
+
+    def load_current_state(self, exp_dir: Path) -> dict[str, dict]:
+        """
+        Reconstruct current state from base + deltas.
+
+        Args:
+            exp_dir: Experiment directory containing parquet files.
+
+        Returns:
+            Dictionary mapping path to file record.
+        """
+        base_file = self._find_latest_base(exp_dir)
+        if not base_file:
+            return {}
+
+        # Start with base
+        state = {}
+        base_table = pq.read_table(base_file)
+        for i in range(base_table.num_rows):
+            record = {col: base_table[col][i].as_py() for col in base_table.column_names}
+            state[record["path"]] = record
+
+        # Apply deltas in order
+        for delta_file in self._find_deltas_after_base(exp_dir, base_file):
+            delta_table = pq.read_table(delta_file)
+            for i in range(delta_table.num_rows):
+                record = {col: delta_table[col][i].as_py() for col in delta_table.column_names}
+                path = record["path"]
+                status = record.pop("status", None)
+
+                if status == "removed":
+                    if path in state:
+                        state[path]["on_disk"] = False
+                        state[path]["indexed_at"] = record["indexed_at"]
+                else:  # added or modified
+                    record["on_disk"] = True
+                    state[path] = record
+
+        return state
 
     def snapshot(
         self,
         root: str,
         experiment: Optional[str] = None,
         compute_checksum: bool = False,
-        purge_date: Optional[str] = None,
         workers: int = 1,
         batch_size: int = 10000,
-    ) -> int:
+    ) -> tuple[int, int, int]:
         """
-        Walk a directory tree and capture metadata for all files.
-
-        Uses streaming writes to handle large directories without memory issues.
+        Walk a directory tree and capture metadata, creating base or delta.
 
         Args:
             root: Root directory to snapshot.
             experiment: Optional experiment identifier.
             compute_checksum: Whether to compute SHA-256 checksums.
-            purge_date: Date string for this snapshot (defaults to today).
             workers: Number of parallel workers for processing.
-            batch_size: Number of files to process per batch (default: 10000).
+            batch_size: Number of files to process per batch.
 
         Returns:
-            Number of files cataloged.
+            Tuple of (added_count, modified_count, removed_count).
         """
-        if purge_date is None:
-            purge_date = datetime.now().strftime("%Y-%m-%d")
-
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S.%f")
         root_path = Path(root).resolve()
-        output_path = self._get_parquet_path(purge_date, str(root_path))
+        root_str = str(root_path)
+        exp_dir = self._get_exp_dir(root_str)
+
+        # Walk directory to get current files
+        current_files = {}
+        file_args = []
+
+        for dirpath, _, filenames in os.walk(root_path):
+            for fname in filenames:
+                fpath = str(Path(dirpath) / fname)
+                file_args.append((fpath, compute_checksum, experiment, timestamp))
+
+        # Process files in batches
+        for i in range(0, len(file_args), batch_size):
+            batch = file_args[i:i + batch_size]
+            records = self._process_batch(batch, workers, compute_checksum)
+            for rec in records:
+                current_files[rec["path"]] = rec
+
+        # Load previous state
+        previous_state = self.load_current_state(exp_dir)
+
+        if not previous_state:
+            # First run: create base snapshot
+            return self._write_base(exp_dir, timestamp, current_files)
+
+        # Compute delta
+        return self._write_delta(exp_dir, timestamp, current_files, previous_state)
+
+    def _write_base(self, exp_dir: Path, timestamp: str, files: dict[str, dict]) -> tuple[int, int, int]:
+        """Write a base snapshot file."""
+        records = []
+        for rec in files.values():
+            rec["on_disk"] = True
+            rec["status"] = None  # Base files don't have status
+            records.append(rec)
+
+        if not records:
+            return (0, 0, 0)
+
+        output_path = exp_dir / f"base_{timestamp}.parquet"
         temp_path = output_path.with_suffix('.parquet.tmp')
-        total_count = 0
+        table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+        pq.write_table(table, temp_path)
+        temp_path.rename(output_path)  # Atomic rename
 
-        try:
-            # Stream batches to temp file
-            with pq.ParquetWriter(temp_path, self.SCHEMA) as writer:
-                batch = []
+        return (len(records), 0, 0)
 
-                for dirpath, _, filenames in os.walk(root_path):
-                    for fname in filenames:
-                        fpath = str(Path(dirpath) / fname)
-                        batch.append((fpath, compute_checksum, experiment, purge_date))
+    def _write_delta(
+        self,
+        exp_dir: Path,
+        timestamp: str,
+        current_files: dict[str, dict],
+        previous_state: dict[str, dict],
+    ) -> tuple[int, int, int]:
+        """Compute and write a delta file."""
+        delta_records = []
+        added = 0
+        modified = 0
+        removed = 0
 
-                        if len(batch) >= batch_size:
-                            records = self._process_batch(batch, workers, compute_checksum)
-                            if records:
-                                table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-                                writer.write_table(table)
-                                total_count += len(records)
-                            batch = []
+        # Find added/modified files
+        for path, meta in current_files.items():
+            if path not in previous_state:
+                delta_records.append({**meta, "status": "added", "on_disk": None})
+                added += 1
+            elif not previous_state[path].get("on_disk", True):
+                # File was removed but now exists again (restored)
+                delta_records.append({**meta, "status": "added", "on_disk": None})
+                added += 1
+            elif self._file_changed(meta, previous_state[path]):
+                delta_records.append({**meta, "status": "modified", "on_disk": None})
+                modified += 1
 
-                # Process final batch
-                if batch:
-                    records = self._process_batch(batch, workers, compute_checksum)
-                    if records:
-                        table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-                        writer.write_table(table)
-                        total_count += len(records)
+        # Find removed files (only those that were on_disk=True)
+        for path, prev_rec in previous_state.items():
+            if path not in current_files and prev_rec.get("on_disk", True):
+                delta_records.append({
+                    "path": path,
+                    "parent_path": prev_rec.get("parent_path", ""),
+                    "filename": prev_rec.get("filename", ""),
+                    "size": prev_rec.get("size"),
+                    "mtime": prev_rec.get("mtime"),
+                    "owner": prev_rec.get("owner"),
+                    "group_name": prev_rec.get("group_name"),
+                    "permissions": prev_rec.get("permissions"),
+                    "checksum": prev_rec.get("checksum"),
+                    "experiment": prev_rec.get("experiment"),
+                    "run": prev_rec.get("run"),
+                    "indexed_at": timestamp,
+                    "status": "removed",
+                    "on_disk": None,
+                })
+                removed += 1
 
-            # Atomic rename only on success
-            if total_count > 0:
-                temp_path.rename(output_path)
-            else:
-                temp_path.unlink()
+        if not delta_records:
+            return (0, 0, 0)
 
-        except Exception:
-            # Clean up temp file on failure
-            if temp_path.exists():
-                temp_path.unlink()
-            raise
+        output_path = exp_dir / f"delta_{timestamp}.parquet"
+        temp_path = output_path.with_suffix('.parquet.tmp')
+        table = pa.Table.from_pylist(delta_records, schema=self.SCHEMA)
+        pq.write_table(table, temp_path)
+        temp_path.rename(output_path)  # Atomic rename
 
-        return total_count
+        return (added, modified, removed)
+
+    def _file_changed(self, current: dict, previous: dict) -> bool:
+        """Check if a file has changed based on size or mtime."""
+        return (
+            current.get("size") != previous.get("size") or
+            current.get("mtime") != previous.get("mtime")
+        )
 
     def _process_batch(
         self, batch: list[tuple], workers: int, compute_checksum: bool
@@ -181,39 +296,73 @@ class ParquetCatalog:
 
         return [r for r in results if r is not None]
 
-    def _query(self, sql: str) -> list[tuple]:
-        """Execute a SQL query on the Parquet files."""
-        pattern = self._get_parquet_pattern()
-        # Replace placeholder with actual pattern
-        sql = sql.replace("FILES", f"'{pattern}'")
-        return duckdb.execute(sql).fetchall()
+    def _get_all_current_state(self) -> dict[str, dict]:
+        """Load current state from all experiments."""
+        all_state = {}
+        for exp_dir in self.catalog_dir.iterdir():
+            if exp_dir.is_dir():
+                state = self.load_current_state(exp_dir)
+                all_state.update(state)
+        return all_state
 
-    def ls(self, path: str) -> list[FileEntry]:
+    def _query_with_dedup(self, sql: str) -> list[tuple]:
+        """Execute SQL query with deduplication across base + deltas."""
+        # Build a CTE that reconstructs current state
+        pattern = str(self.catalog_dir / "*" / "*.parquet")
+
+        # Handle both base files (have on_disk, no status) and delta files (have status, no on_disk)
+        # Use COALESCE and CASE to handle missing columns gracefully
+        dedup_cte = f"""
+            WITH ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (PARTITION BY path ORDER BY indexed_at DESC) as _rn
+                FROM read_parquet('{pattern}', union_by_name=true)
+            ),
+            files AS (
+                SELECT path, parent_path, filename, size, mtime, owner, group_name,
+                       permissions, checksum, experiment, run, indexed_at,
+                       CASE
+                           WHEN on_disk IS NOT NULL THEN on_disk
+                           WHEN status IS NOT NULL THEN status != 'removed'
+                           ELSE true
+                       END as on_disk
+                FROM ranked
+                WHERE _rn = 1
+            )
+        """
+
+        full_sql = dedup_cte + sql
+        return duckdb.execute(full_sql).fetchall()
+
+    def ls(self, path: str, on_disk_only: bool = False) -> list[FileEntry]:
         """
         List files in a directory.
 
         Args:
             path: Directory path to list.
+            on_disk_only: If True, only return files currently on disk.
 
         Returns:
             List of FileEntry objects for files in that directory.
         """
+        on_disk_filter = "AND on_disk = true" if on_disk_only else ""
         sql = f"""
             SELECT path, parent_path, filename, size, mtime, owner, group_name,
-                   permissions, checksum, archive_uri, experiment, run, purge_date
-            FROM FILES
-            WHERE parent_path = '{path}'
+                   permissions, checksum, NULL as archive_uri, experiment, run, indexed_at
+            FROM files
+            WHERE parent_path = '{path}' {on_disk_filter}
             ORDER BY filename
         """
-        rows = self._query(sql)
+        rows = self._query_with_dedup(sql)
         return [FileEntry(*row) for row in rows]
 
-    def ls_dirs(self, path: str) -> list[DirSummary]:
+    def ls_dirs(self, path: str, on_disk_only: bool = False) -> list[DirSummary]:
         """
         List immediate subdirectories under a path with aggregated stats.
 
         Args:
             path: Parent directory path.
+            on_disk_only: If True, only count files currently on disk.
 
         Returns:
             List of DirSummary objects for each subdirectory.
@@ -221,6 +370,7 @@ class ParquetCatalog:
         path = path.rstrip("/")
         prefix = path + "/"
         prefix_len = len(prefix)
+        on_disk_filter = "AND on_disk = true" if on_disk_only else ""
 
         sql = f"""
             SELECT
@@ -232,14 +382,15 @@ class ParquetCatalog:
                 END as dirname,
                 SUM(size) as total_size,
                 COUNT(*) as file_count
-            FROM FILES
+            FROM files
             WHERE parent_path LIKE '{prefix}%'
               AND parent_path != '{path}'
+              {on_disk_filter}
             GROUP BY dirname
             HAVING dirname != ''
             ORDER BY dirname
         """
-        rows = self._query(sql)
+        rows = self._query_with_dedup(sql)
         return [DirSummary(*row) for row in rows]
 
     def find(
@@ -249,6 +400,8 @@ class ParquetCatalog:
         size_lt: Optional[int] = None,
         experiment: Optional[str] = None,
         exclude: Optional[list[str]] = None,
+        on_disk_only: bool = False,
+        removed_only: bool = False,
     ) -> list[FileEntry]:
         """
         Search for files matching a pattern.
@@ -259,6 +412,8 @@ class ParquetCatalog:
             size_lt: Maximum file size in bytes.
             experiment: Filter by experiment ID.
             exclude: List of patterns to exclude (NOT LIKE).
+            on_disk_only: If True, only return files currently on disk.
+            removed_only: If True, only return files that have been removed.
 
         Returns:
             List of matching FileEntry objects.
@@ -274,17 +429,21 @@ class ParquetCatalog:
             conditions.append(f"size < {size_lt}")
         if experiment is not None:
             conditions.append(f"experiment = '{experiment}'")
+        if on_disk_only:
+            conditions.append("on_disk = true")
+        if removed_only:
+            conditions.append("on_disk = false")
 
         where_clause = " AND ".join(conditions)
 
         sql = f"""
             SELECT path, parent_path, filename, size, mtime, owner, group_name,
-                   permissions, checksum, archive_uri, experiment, run, purge_date
-            FROM FILES
+                   permissions, checksum, NULL as archive_uri, experiment, run, indexed_at
+            FROM files
             WHERE {where_clause}
             ORDER BY path
         """
-        rows = self._query(sql)
+        rows = self._query_with_dedup(sql)
         return [FileEntry(*row) for row in rows]
 
     def tree(self, path: str, depth: int = 2) -> str:
@@ -307,8 +466,8 @@ class ParquetCatalog:
         if depth <= 0:
             return
 
-        dirs = self.ls_dirs(path)
-        files = self.ls(path)
+        dirs = self.ls_dirs(path, on_disk_only=True)
+        files = self.ls(path, on_disk_only=True)
 
         items = [(d.dirname, True, d) for d in dirs] + [(f.filename, False, f) for f in files]
         items.sort(key=lambda x: x[0])
@@ -324,16 +483,18 @@ class ParquetCatalog:
             else:
                 lines.append(f"{prefix}{connector}{name} ({item.size_human})")
 
-    def count(self) -> int:
+    def count(self, on_disk_only: bool = False) -> int:
         """Return total number of files in the catalog."""
-        sql = "SELECT COUNT(*) FROM FILES"
-        result = self._query(sql)
+        on_disk_filter = "WHERE on_disk = true" if on_disk_only else ""
+        sql = f"SELECT COUNT(*) FROM files {on_disk_filter}"
+        result = self._query_with_dedup(sql)
         return result[0][0] if result else 0
 
-    def total_size(self) -> int:
+    def total_size(self, on_disk_only: bool = False) -> int:
         """Return total size of all files in the catalog."""
-        sql = "SELECT COALESCE(SUM(size), 0) FROM FILES"
-        result = self._query(sql)
+        on_disk_filter = "WHERE on_disk = true" if on_disk_only else ""
+        sql = f"SELECT COALESCE(SUM(size), 0) FROM files {on_disk_filter}"
+        result = self._query_with_dedup(sql)
         return result[0][0] if result else 0
 
     def query(self, sql: str) -> list[tuple]:
@@ -346,14 +507,103 @@ class ParquetCatalog:
         Returns:
             List of result tuples.
         """
-        pattern = self._get_parquet_pattern()
-        # Replace 'files' table reference with parquet glob pattern
-        sql = sql.replace("files", f"'{pattern}'")
-        sql = sql.replace("FILES", f"'{pattern}'")
-        return duckdb.execute(sql).fetchall()
+        return self._query_with_dedup(sql)
+
+    def consolidate(self, archive_dir: Optional[str] = None) -> dict[str, int]:
+        """
+        Merge base + deltas into new base files for each experiment.
+
+        Args:
+            archive_dir: Optional directory to move old files to (instead of deleting).
+
+        Returns:
+            Dictionary with consolidation stats.
+        """
+        stats = {"experiments": 0, "files_removed": 0, "files_archived": 0}
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S.%f")
+
+        for exp_dir in self.catalog_dir.iterdir():
+            if not exp_dir.is_dir():
+                continue
+
+            # Get all parquet files
+            all_files = list(exp_dir.glob("*.parquet"))
+            if len(all_files) <= 1:
+                continue  # Nothing to consolidate
+
+            # Reconstruct current state
+            state = self.load_current_state(exp_dir)
+            if not state:
+                continue
+
+            # Write new base with all records
+            records = []
+            for rec in state.values():
+                rec["status"] = None  # Base files don't have status
+                records.append(rec)
+            new_base = exp_dir / f"base_{timestamp}.parquet"
+            temp_path = new_base.with_suffix('.parquet.tmp')
+            table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+            pq.write_table(table, temp_path)
+            temp_path.rename(new_base)  # Atomic rename
+
+            # Handle old files
+            old_files = [f for f in all_files if f != new_base]
+
+            if archive_dir:
+                archive_exp_dir = Path(archive_dir) / exp_dir.name
+                archive_exp_dir.mkdir(parents=True, exist_ok=True)
+                for f in old_files:
+                    shutil.move(str(f), str(archive_exp_dir / f.name))
+                    stats["files_archived"] += 1
+            else:
+                for f in old_files:
+                    f.unlink()
+                    stats["files_removed"] += 1
+
+            stats["experiments"] += 1
+
+        return stats
+
+    def list_snapshots(self, exp_hash: Optional[str] = None) -> list[dict]:
+        """
+        List all snapshot files in the catalog.
+
+        Args:
+            exp_hash: Optional experiment hash to filter by.
+
+        Returns:
+            List of snapshot info dictionaries.
+        """
+        snapshots = []
+
+        dirs_to_scan = [self.catalog_dir / exp_hash] if exp_hash else self.catalog_dir.iterdir()
+
+        for exp_dir in dirs_to_scan:
+            if not exp_dir.is_dir():
+                continue
+
+            for pq_file in sorted(exp_dir.glob("*.parquet")):
+                file_type = "base" if pq_file.name.startswith("base_") else "delta"
+                timestamp = pq_file.stem.split("_", 1)[1] if "_" in pq_file.stem else ""
+
+                # Get file stats
+                stat = pq_file.stat()
+                table = pq.read_table(pq_file)
+
+                snapshots.append({
+                    "experiment": exp_dir.name,
+                    "type": file_type,
+                    "timestamp": timestamp,
+                    "file": str(pq_file),
+                    "size_bytes": stat.st_size,
+                    "record_count": table.num_rows,
+                })
+
+        return snapshots
 
     def close(self):
-        """No-op for API compatibility with Catalog."""
+        """No-op for API compatibility."""
         pass
 
     def __enter__(self):

@@ -38,7 +38,6 @@ run_snapshot() {
     output=$(lcls-catalog snapshot "$exp_path" \
       -e "$exp" \
       -o "$OUTPUT_DIR" \
-      --format parquet \
       --workers "$WORKERS" 2>&1) || {
         echo "$(date '+%Y-%m-%d %H:%M:%S'): Warning: Error indexing $hutch/$exp: $output" >> "$LOG_FILE"
         return 1

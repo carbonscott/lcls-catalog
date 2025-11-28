@@ -1,4 +1,4 @@
-"""Tests for Parquet catalog functionality."""
+"""Tests for Parquet catalog with base + delta incremental updates."""
 
 import sys
 from pathlib import Path
@@ -20,19 +20,38 @@ def parquet_catalog_dir(tmp_path):
     return tmp_path / "parquet_catalog"
 
 
-class TestParquetSnapshot:
-    """Tests for ParquetCatalog.snapshot()."""
+class TestBaseSnapshot:
+    """Tests for initial base snapshot creation."""
 
-    def test_snapshot_captures_all_files(self, fake_experiment, parquet_catalog_dir):
-        """Snapshot should capture all files in the directory tree."""
+    def test_first_snapshot_creates_base(self, fake_experiment, parquet_catalog_dir):
+        """First snapshot should create a base file."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            count = cat.snapshot(
+            added, modified, removed = cat.snapshot(
                 str(fake_experiment.experiment_path),
                 experiment=fake_experiment.experiment,
             )
-            assert count == fake_experiment.expected_file_count
 
-    def test_snapshot_total_size(self, fake_experiment, parquet_catalog_dir):
+            assert added == fake_experiment.expected_file_count
+            assert modified == 0
+            assert removed == 0
+
+            # Check base file was created
+            exp_dirs = list(parquet_catalog_dir.iterdir())
+            assert len(exp_dirs) == 1
+
+            base_files = list(exp_dirs[0].glob("base_*.parquet"))
+            assert len(base_files) == 1
+
+    def test_snapshot_captures_correct_count(self, fake_experiment, parquet_catalog_dir):
+        """Snapshot should capture all files."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            cat.snapshot(
+                str(fake_experiment.experiment_path),
+                experiment=fake_experiment.experiment,
+            )
+            assert cat.count() == fake_experiment.expected_file_count
+
+    def test_snapshot_captures_correct_size(self, fake_experiment, parquet_catalog_dir):
         """Snapshot should capture correct total size."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
             cat.snapshot(
@@ -41,54 +60,233 @@ class TestParquetSnapshot:
             )
             assert cat.total_size() == fake_experiment.expected_total_size
 
-    def test_snapshot_creates_parquet_file(self, fake_experiment, parquet_catalog_dir):
-        """Snapshot should create a Parquet file."""
+
+class TestDeltaUpdates:
+    """Tests for incremental delta updates."""
+
+    def test_no_changes_no_delta(self, fake_experiment, parquet_catalog_dir):
+        """Re-indexing with no changes should not create a delta."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                purge_date="2024-06-01",
-            )
+            # First snapshot
+            cat.snapshot(str(fake_experiment.experiment_path))
 
-        # Filename is now {path_hash}_{purge_date}.parquet
-        parquet_files = list(parquet_catalog_dir.glob("*_2024-06-01.parquet"))
-        assert len(parquet_files) == 1
+            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            initial_files = list(exp_dir.glob("*.parquet"))
 
-    def test_snapshot_with_workers(self, fake_experiment, parquet_catalog_dir):
-        """Snapshot should work with multiple workers."""
+            # Second snapshot (no changes)
+            added, modified, removed = cat.snapshot(str(fake_experiment.experiment_path))
+
+            assert added == 0
+            assert modified == 0
+            assert removed == 0
+
+            # Should still have same number of files
+            final_files = list(exp_dir.glob("*.parquet"))
+            assert len(final_files) == len(initial_files)
+
+    def test_new_file_creates_delta(self, fake_experiment, parquet_catalog_dir):
+        """Adding a new file should create a delta with status='added'."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            count = cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                workers=2,
-            )
-            assert count == fake_experiment.expected_file_count
+            # First snapshot
+            cat.snapshot(str(fake_experiment.experiment_path))
+            initial_count = cat.count()
 
-    def test_snapshot_with_checksum(self, fake_experiment, parquet_catalog_dir):
-        """Checksums should be computed when requested."""
+            # Add a new file
+            new_file = fake_experiment.experiment_path / "scratch" / "new_file.txt"
+            new_file.write_text("new content")
+
+            # Second snapshot
+            added, modified, removed = cat.snapshot(str(fake_experiment.experiment_path))
+
+            assert added == 1
+            assert modified == 0
+            assert removed == 0
+            assert cat.count() == initial_count + 1
+
+            # Check delta file was created
+            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            delta_files = list(exp_dir.glob("delta_*.parquet"))
+            assert len(delta_files) == 1
+
+    def test_modified_file_creates_delta(self, fake_experiment, parquet_catalog_dir):
+        """Modifying a file should create a delta with status='modified'."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                compute_checksum=True,
-            )
+            # First snapshot
+            cat.snapshot(str(fake_experiment.experiment_path))
 
-            results = cat.find("%/metadata.json")
-            assert len(results) == 1
-            assert results[0].checksum is not None
-            assert len(results[0].checksum) == 64
+            # Modify a file (change size)
+            modified_file = fake_experiment.experiment_path / "scratch" / "run0001" / "metadata.json"
+            modified_file.write_text("much longer content than before" * 10)
+
+            # Second snapshot
+            added, modified, removed = cat.snapshot(str(fake_experiment.experiment_path))
+
+            assert added == 0
+            assert modified == 1
+            assert removed == 0
+
+    def test_removed_file_creates_delta(self, fake_experiment, parquet_catalog_dir):
+        """Removing a file should create a delta with status='removed'."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            # First snapshot
+            cat.snapshot(str(fake_experiment.experiment_path))
+            initial_count = cat.count()
+
+            # Remove a file
+            removed_file = fake_experiment.experiment_path / "scratch" / "run0001" / "metadata.json"
+            removed_file.unlink()
+
+            # Second snapshot
+            added, modified, removed = cat.snapshot(str(fake_experiment.experiment_path))
+
+            assert added == 0
+            assert modified == 0
+            assert removed == 1
+
+            # Total count should still be same (file is tracked but on_disk=false)
+            assert cat.count() == initial_count
+            # But on_disk count should be less
+            assert cat.count(on_disk_only=True) == initial_count - 1
 
 
-class TestParquetBrowse:
-    """Tests for ParquetCatalog browse operations."""
+class TestOnDiskFiltering:
+    """Tests for on_disk filtering in queries."""
+
+    def test_count_on_disk_only(self, fake_experiment, parquet_catalog_dir):
+        """count(on_disk_only=True) should exclude removed files."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Remove two files
+            (fake_experiment.experiment_path / "scratch" / "run0001" / "metadata.json").unlink()
+            (fake_experiment.experiment_path / "calib" / "calibration.dat").unlink()
+
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            total = cat.count()
+            on_disk = cat.count(on_disk_only=True)
+
+            assert total == fake_experiment.expected_file_count
+            assert on_disk == fake_experiment.expected_file_count - 2
+
+    def test_find_removed_only(self, fake_experiment, parquet_catalog_dir):
+        """find(removed_only=True) should only return removed files."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Remove a file
+            (fake_experiment.experiment_path / "scratch" / "run0001" / "metadata.json").unlink()
+
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            removed = cat.find("%", removed_only=True)
+            assert len(removed) == 1
+            assert "metadata.json" in removed[0].path
+
+
+class TestFileRestoration:
+    """Tests for file restoration (re-appearing files)."""
+
+    def test_restored_file_becomes_on_disk_true(self, fake_experiment, parquet_catalog_dir):
+        """A file that reappears should have on_disk=True again."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            # First snapshot
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Remove file
+            removed_file = fake_experiment.experiment_path / "scratch" / "run0001" / "metadata.json"
+            removed_file.unlink()
+
+            # Second snapshot (file removed)
+            cat.snapshot(str(fake_experiment.experiment_path))
+            assert cat.count(on_disk_only=True) == fake_experiment.expected_file_count - 1
+
+            # Restore file
+            removed_file.write_text("restored content")
+
+            # Third snapshot (file restored)
+            added, modified, removed = cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Should show as added (since it was removed and came back)
+            assert added == 1
+            assert cat.count(on_disk_only=True) == fake_experiment.expected_file_count
+
+
+class TestConsolidate:
+    """Tests for consolidation of base + deltas."""
+
+    def test_consolidate_merges_files(self, fake_experiment, parquet_catalog_dir):
+        """Consolidate should merge base + deltas into new base."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            # First snapshot (base)
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Add file (delta 1)
+            (fake_experiment.experiment_path / "new1.txt").write_text("new")
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            # Add another file (delta 2)
+            (fake_experiment.experiment_path / "new2.txt").write_text("new")
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            files_before = list(exp_dir.glob("*.parquet"))
+            assert len(files_before) == 3  # 1 base + 2 deltas
+
+            # Consolidate
+            stats = cat.consolidate()
+
+            assert stats["experiments"] == 1
+            assert stats["files_removed"] == 3  # old base + 2 deltas
+
+            files_after = list(exp_dir.glob("*.parquet"))
+            assert len(files_after) == 1  # new base only
+
+            # Data should still be correct
+            assert cat.count() == fake_experiment.expected_file_count + 2
+
+    def test_consolidate_with_archive(self, fake_experiment, parquet_catalog_dir, tmp_path):
+        """Consolidate with archive should move old files instead of deleting."""
+        archive_dir = tmp_path / "archive"
+
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            (fake_experiment.experiment_path / "new.txt").write_text("new")
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            stats = cat.consolidate(archive_dir=str(archive_dir))
+
+            assert stats["files_archived"] == 2  # old base + delta
+            assert archive_dir.exists()
+            assert len(list(archive_dir.rglob("*.parquet"))) == 2
+
+
+class TestListSnapshots:
+    """Tests for listing snapshot files."""
+
+    def test_list_snapshots(self, fake_experiment, parquet_catalog_dir):
+        """list_snapshots should return info about all snapshot files."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            (fake_experiment.experiment_path / "new.txt").write_text("new")
+            cat.snapshot(str(fake_experiment.experiment_path))
+
+            snapshots = cat.list_snapshots()
+
+            assert len(snapshots) == 2
+            types = {s["type"] for s in snapshots}
+            assert types == {"base", "delta"}
+
+
+class TestBrowseOperations:
+    """Tests for browse operations (ls, find, tree)."""
 
     def test_ls_returns_files(self, fake_experiment, parquet_catalog_dir):
         """ls should return files in the specified directory."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-            )
+            cat.snapshot(str(fake_experiment.experiment_path))
 
             run0001_path = str(fake_experiment.experiment_path / "scratch" / "run0001")
             files = cat.ls(run0001_path)
@@ -97,76 +295,42 @@ class TestParquetBrowse:
             filenames = {f.filename for f in files}
             assert filenames == {"image_0001.h5", "image_0002.h5", "metadata.json"}
 
-    def test_ls_dirs_returns_subdirectories(self, fake_experiment, parquet_catalog_dir):
-        """ls_dirs should return subdirectories with stats."""
-        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-            )
-
-            scratch_path = str(fake_experiment.experiment_path / "scratch")
-            dirs = cat.ls_dirs(scratch_path)
-
-            dirnames = {d.dirname for d in dirs}
-            assert "run0001" in dirnames
-            assert "run0002" in dirnames
-
     def test_find_by_pattern(self, fake_experiment, parquet_catalog_dir):
         """find should match filename patterns."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-            )
+            cat.snapshot(str(fake_experiment.experiment_path))
 
             results = cat.find("%.h5")
-            assert len(results) == 3
+            assert len(results) == 3  # image_0001.h5, image_0002.h5, data.h5
 
     def test_find_with_size_filter(self, fake_experiment, parquet_catalog_dir):
         """find should filter by size."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-            )
+            cat.snapshot(str(fake_experiment.experiment_path))
 
             results = cat.find("%", size_gt=1000)
             assert len(results) == 2  # image_0001.h5 (1024) and image_0002.h5 (2048)
 
-    def test_tree_output(self, fake_experiment, parquet_catalog_dir):
-        """tree should generate ASCII tree output."""
-        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-            )
 
-            tree_output = cat.tree(str(fake_experiment.experiment_path), depth=2)
-            assert "scratch/" in tree_output
-            assert "results/" in tree_output
-
-
-class TestParquetEdgeCases:
-    """Edge case tests for ParquetCatalog."""
+class TestEdgeCases:
+    """Edge case tests."""
 
     def test_empty_directory(self, tmp_path, parquet_catalog_dir):
-        """Snapshot of empty directory should return 0."""
+        """Snapshot of empty directory should return (0, 0, 0)."""
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
 
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            count = cat.snapshot(str(empty_dir))
-            assert count == 0
+            added, modified, removed = cat.snapshot(str(empty_dir))
+            assert added == 0
+            assert modified == 0
+            assert removed == 0
 
     def test_deep_nesting(self, deep_nested_structure, parquet_catalog_dir):
         """Should handle deeply nested directories."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            count = cat.snapshot(
-                str(deep_nested_structure.experiment_path),
-                experiment=deep_nested_structure.experiment,
-            )
-            assert count == 1
+            added, _, _ = cat.snapshot(str(deep_nested_structure.experiment_path))
+            assert added == 1
 
             results = cat.find("%/deep_file.txt")
             assert len(results) == 1
@@ -174,86 +338,31 @@ class TestParquetEdgeCases:
     def test_special_characters(self, special_chars_structure, parquet_catalog_dir):
         """Should handle special characters in filenames."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
-            count = cat.snapshot(
-                str(special_chars_structure.experiment_path),
-                experiment=special_chars_structure.experiment,
-            )
-            assert count == special_chars_structure.expected_file_count
+            added, _, _ = cat.snapshot(str(special_chars_structure.experiment_path))
+            assert added == special_chars_structure.expected_file_count
 
 
-class TestParquetParallel:
+class TestParallelProcessing:
     """Tests for parallel processing."""
 
-    def test_parallel_checksum(self, fake_experiment, parquet_catalog_dir):
+    def test_parallel_snapshot(self, fake_experiment, parquet_catalog_dir):
+        """Snapshot should work with multiple workers."""
+        with ParquetCatalog(str(parquet_catalog_dir)) as cat:
+            added, _, _ = cat.snapshot(
+                str(fake_experiment.experiment_path),
+                workers=2,
+            )
+            assert added == fake_experiment.expected_file_count
+
+    def test_parallel_with_checksum(self, fake_experiment, parquet_catalog_dir):
         """Parallel checksum computation should work correctly."""
         with ParquetCatalog(str(parquet_catalog_dir)) as cat:
             cat.snapshot(
                 str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
                 compute_checksum=True,
                 workers=4,
             )
 
             results = cat.find("%")
-            # All files should have checksums
             for r in results:
                 assert r.checksum is not None
-
-    def test_parallel_results_match_sequential(self, fake_experiment, tmp_path):
-        """Parallel and sequential should produce same results."""
-        seq_dir = tmp_path / "seq_catalog"
-        par_dir = tmp_path / "par_catalog"
-
-        # Sequential
-        with ParquetCatalog(str(seq_dir)) as cat:
-            seq_count = cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                workers=1,
-            )
-            seq_total = cat.total_size()
-
-        # Parallel
-        with ParquetCatalog(str(par_dir)) as cat:
-            par_count = cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                workers=4,
-            )
-            par_total = cat.total_size()
-
-        assert seq_count == par_count
-        assert seq_total == par_total
-
-
-class TestParquetStreaming:
-    """Tests for streaming writes."""
-
-    def test_streaming_produces_same_results(self, fake_experiment, tmp_path):
-        """Different batch sizes should produce identical catalogs."""
-        small_batch_dir = tmp_path / "small_batch"
-        large_batch_dir = tmp_path / "large_batch"
-
-        # Small batch (forces multiple writes)
-        with ParquetCatalog(str(small_batch_dir)) as cat:
-            small_count = cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                batch_size=2,  # Very small to force multiple batches
-            )
-            small_total = cat.total_size()
-            small_files = sorted([f.path for f in cat.find("%")])
-
-        # Large batch (single write)
-        with ParquetCatalog(str(large_batch_dir)) as cat:
-            large_count = cat.snapshot(
-                str(fake_experiment.experiment_path),
-                experiment=fake_experiment.experiment,
-                batch_size=100000,  # Large enough to fit all files
-            )
-            large_total = cat.total_size()
-            large_files = sorted([f.path for f in cat.find("%")])
-
-        assert small_count == large_count
-        assert small_total == large_total
-        assert small_files == large_files

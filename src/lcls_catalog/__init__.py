@@ -1,13 +1,7 @@
-"""LCLS Data Catalog - A lightweight catalog for managing purged data metadata."""
+"""LCLS Data Catalog - Persistent file metadata tracking with incremental updates."""
 
-from .catalog import Catalog
+from .catalog import FileEntry, DirSummary
+from .parquet_catalog import ParquetCatalog
 
-__version__ = "0.1.0"
-__all__ = ["Catalog"]
-
-# Optional Parquet support
-try:
-    from .parquet_catalog import ParquetCatalog
-    __all__.append("ParquetCatalog")
-except ImportError:
-    pass
+__version__ = "0.2.0"
+__all__ = ["ParquetCatalog", "FileEntry", "DirSummary"]
