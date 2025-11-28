@@ -1,0 +1,29 @@
+[project]
+name = "lcls-catalog"
+version = "0.1.0"
+description = "A lightweight catalog system for LCLS data purge management"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+parquet = [
+    "pyarrow>=14.0",
+    "duckdb>=0.9",
+]
+
+[project.scripts]
+lcls-catalog = "lcls_catalog.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
