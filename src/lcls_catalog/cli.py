@@ -58,6 +58,7 @@ def cmd_snapshot(args):
                 compute_checksum=args.checksum,
                 purge_date=args.purge_date,
                 workers=args.workers,
+                batch_size=args.batch_size,
             )
             print(f"Cataloged {count} files to {args.output}/ (parquet, {args.workers} workers)")
     else:
@@ -168,6 +169,10 @@ def main():
     snapshot_parser.add_argument(
         "--workers", type=int, default=1,
         help="Number of parallel workers (parquet only, default: 1)"
+    )
+    snapshot_parser.add_argument(
+        "--batch-size", type=int, default=10000,
+        help="Files per batch for streaming writes (parquet only, default: 10000)"
     )
     snapshot_parser.set_defaults(func=cmd_snapshot)
 

@@ -224,3 +224,36 @@ class TestParquetParallel:
 
         assert seq_count == par_count
         assert seq_total == par_total
+
+
+class TestParquetStreaming:
+    """Tests for streaming writes."""
+
+    def test_streaming_produces_same_results(self, fake_experiment, tmp_path):
+        """Different batch sizes should produce identical catalogs."""
+        small_batch_dir = tmp_path / "small_batch"
+        large_batch_dir = tmp_path / "large_batch"
+
+        # Small batch (forces multiple writes)
+        with ParquetCatalog(str(small_batch_dir)) as cat:
+            small_count = cat.snapshot(
+                str(fake_experiment.experiment_path),
+                experiment=fake_experiment.experiment,
+                batch_size=2,  # Very small to force multiple batches
+            )
+            small_total = cat.total_size()
+            small_files = sorted([f.path for f in cat.find("%")])
+
+        # Large batch (single write)
+        with ParquetCatalog(str(large_batch_dir)) as cat:
+            large_count = cat.snapshot(
+                str(fake_experiment.experiment_path),
+                experiment=fake_experiment.experiment,
+                batch_size=100000,  # Large enough to fit all files
+            )
+            large_total = cat.total_size()
+            large_files = sorted([f.path for f in cat.find("%")])
+
+        assert small_count == large_count
+        assert small_total == large_total
+        assert small_files == large_files

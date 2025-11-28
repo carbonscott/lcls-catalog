@@ -101,9 +101,12 @@ class ParquetCatalog:
         compute_checksum: bool = False,
         purge_date: Optional[str] = None,
         workers: int = 1,
+        batch_size: int = 10000,
     ) -> int:
         """
         Walk a directory tree and capture metadata for all files.
+
+        Uses streaming writes to handle large directories without memory issues.
 
         Args:
             root: Root directory to snapshot.
@@ -111,6 +114,7 @@ class ParquetCatalog:
             compute_checksum: Whether to compute SHA-256 checksums.
             purge_date: Date string for this snapshot (defaults to today).
             workers: Number of parallel workers for processing.
+            batch_size: Number of files to process per batch (default: 10000).
 
         Returns:
             Number of files cataloged.
@@ -119,41 +123,53 @@ class ParquetCatalog:
             purge_date = datetime.now().strftime("%Y-%m-%d")
 
         root_path = Path(root).resolve()
-
-        # Collect all file paths (fast, single process)
-        file_paths = []
-        for dirpath, _, filenames in os.walk(root_path):
-            for fname in filenames:
-                file_paths.append(str(Path(dirpath) / fname))
-
-        if not file_paths:
-            return 0
-
-        # Process files in parallel
-        args = [(fp, compute_checksum, experiment, purge_date) for fp in file_paths]
-
-        if workers > 1:
-            # Use ProcessPoolExecutor for CPU-bound (checksum), ThreadPoolExecutor for I/O-bound
-            executor_class = ProcessPoolExecutor if compute_checksum else ThreadPoolExecutor
-            # Batch work to reduce overhead
-            chunksize = max(1, len(file_paths) // (workers * 4))
-            with executor_class(max_workers=workers) as executor:
-                results = list(executor.map(_process_file, args, chunksize=chunksize))
-        else:
-            results = [_process_file(arg) for arg in args]
-
-        # Filter out None results (failed files)
-        records = [r for r in results if r is not None]
-
-        if not records:
-            return 0
-
-        # Create PyArrow table and write to Parquet
-        table = pa.Table.from_pylist(records, schema=self.SCHEMA)
         output_path = self._get_parquet_path(purge_date, str(root_path))
-        pq.write_table(table, output_path)
+        total_count = 0
 
-        return len(records)
+        # Stream batches to Parquet file
+        with pq.ParquetWriter(output_path, self.SCHEMA) as writer:
+            batch = []
+
+            for dirpath, _, filenames in os.walk(root_path):
+                for fname in filenames:
+                    fpath = str(Path(dirpath) / fname)
+                    batch.append((fpath, compute_checksum, experiment, purge_date))
+
+                    if len(batch) >= batch_size:
+                        records = self._process_batch(batch, workers, compute_checksum)
+                        if records:
+                            table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+                            writer.write_table(table)
+                            total_count += len(records)
+                        batch = []
+
+            # Process final batch
+            if batch:
+                records = self._process_batch(batch, workers, compute_checksum)
+                if records:
+                    table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+                    writer.write_table(table)
+                    total_count += len(records)
+
+        # Remove empty file if no records
+        if total_count == 0 and output_path.exists():
+            output_path.unlink()
+
+        return total_count
+
+    def _process_batch(
+        self, batch: list[tuple], workers: int, compute_checksum: bool
+    ) -> list[dict]:
+        """Process a batch of files with optional parallelism."""
+        if workers > 1:
+            executor_class = ProcessPoolExecutor if compute_checksum else ThreadPoolExecutor
+            chunksize = max(1, len(batch) // (workers * 4))
+            with executor_class(max_workers=workers) as executor:
+                results = list(executor.map(_process_file, batch, chunksize=chunksize))
+        else:
+            results = [_process_file(arg) for arg in batch]
+
+        return [r for r in results if r is not None]
 
     def _query(self, sql: str) -> list[tuple]:
         """Execute a SQL query on the Parquet files."""
