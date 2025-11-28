@@ -124,36 +124,46 @@ class ParquetCatalog:
 
         root_path = Path(root).resolve()
         output_path = self._get_parquet_path(purge_date, str(root_path))
+        temp_path = output_path.with_suffix('.parquet.tmp')
         total_count = 0
 
-        # Stream batches to Parquet file
-        with pq.ParquetWriter(output_path, self.SCHEMA) as writer:
-            batch = []
+        try:
+            # Stream batches to temp file
+            with pq.ParquetWriter(temp_path, self.SCHEMA) as writer:
+                batch = []
 
-            for dirpath, _, filenames in os.walk(root_path):
-                for fname in filenames:
-                    fpath = str(Path(dirpath) / fname)
-                    batch.append((fpath, compute_checksum, experiment, purge_date))
+                for dirpath, _, filenames in os.walk(root_path):
+                    for fname in filenames:
+                        fpath = str(Path(dirpath) / fname)
+                        batch.append((fpath, compute_checksum, experiment, purge_date))
 
-                    if len(batch) >= batch_size:
-                        records = self._process_batch(batch, workers, compute_checksum)
-                        if records:
-                            table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-                            writer.write_table(table)
-                            total_count += len(records)
-                        batch = []
+                        if len(batch) >= batch_size:
+                            records = self._process_batch(batch, workers, compute_checksum)
+                            if records:
+                                table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+                                writer.write_table(table)
+                                total_count += len(records)
+                            batch = []
 
-            # Process final batch
-            if batch:
-                records = self._process_batch(batch, workers, compute_checksum)
-                if records:
-                    table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-                    writer.write_table(table)
-                    total_count += len(records)
+                # Process final batch
+                if batch:
+                    records = self._process_batch(batch, workers, compute_checksum)
+                    if records:
+                        table = pa.Table.from_pylist(records, schema=self.SCHEMA)
+                        writer.write_table(table)
+                        total_count += len(records)
 
-        # Remove empty file if no records
-        if total_count == 0 and output_path.exists():
-            output_path.unlink()
+            # Atomic rename only on success
+            if total_count > 0:
+                temp_path.rename(output_path)
+            else:
+                temp_path.unlink()
+
+        except Exception:
+            # Clean up temp file on failure
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
         return total_count
 
