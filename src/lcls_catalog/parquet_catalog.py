@@ -87,10 +87,13 @@ class ParquetCatalog:
         self.catalog_dir = Path(catalog_dir)
         self.catalog_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_exp_dir(self, root: str) -> Path:
-        """Get directory for a specific experiment based on root path hash."""
-        path_hash = hashlib.md5(root.encode()).hexdigest()[:8]
-        exp_dir = self.catalog_dir / path_hash
+    def _get_exp_dir(self, root: str, experiment: Optional[str] = None) -> Path:
+        """Get directory for a specific experiment."""
+        if experiment:
+            dir_name = experiment
+        else:
+            dir_name = hashlib.md5(root.encode()).hexdigest()[:8]
+        exp_dir = self.catalog_dir / dir_name
         exp_dir.mkdir(parents=True, exist_ok=True)
         return exp_dir
 
@@ -170,7 +173,7 @@ class ParquetCatalog:
         timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S.%f")
         root_path = Path(root).resolve()
         root_str = str(root_path)
-        exp_dir = self._get_exp_dir(root_str)
+        exp_dir = self._get_exp_dir(root_str, experiment)
 
         # Walk directory to get current files
         current_files = {}
