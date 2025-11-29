@@ -405,6 +405,7 @@ class ParquetCatalog:
         exclude: Optional[list[str]] = None,
         on_disk_only: bool = False,
         removed_only: bool = False,
+        skip_symlinks: bool = False,
     ) -> list[FileEntry]:
         """
         Search for files matching a pattern.
@@ -417,6 +418,7 @@ class ParquetCatalog:
             exclude: List of patterns to exclude (NOT LIKE).
             on_disk_only: If True, only return files currently on disk.
             removed_only: If True, only return files that have been removed.
+            skip_symlinks: If True, exclude symbolic links from results.
 
         Returns:
             List of matching FileEntry objects.
@@ -436,6 +438,9 @@ class ParquetCatalog:
             conditions.append("on_disk = true")
         if removed_only:
             conditions.append("on_disk = false")
+        if skip_symlinks:
+            # S_IFMT=0o170000=61440, S_IFLNK=0o120000=40960
+            conditions.append("(permissions & 61440) != 40960")
 
         where_clause = " AND ".join(conditions)
 

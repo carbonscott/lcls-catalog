@@ -76,6 +76,7 @@ def cmd_find(args):
             exclude=args.exclude if args.exclude else None,
             on_disk_only=args.on_disk,
             removed_only=args.removed,
+            skip_symlinks=args.no_symlinks,
         )
         if not results:
             print(f"No files matching '{args.pattern}'")
@@ -233,6 +234,10 @@ def main():
     find_parser.add_argument(
         "-H", "--human-readable", action="store_true", dest="human",
         help="Print sizes in human-readable format (e.g., 1.2 GB)"
+    )
+    find_parser.add_argument(
+        "--no-symlinks", action="store_true",
+        help="Exclude symbolic links from results"
     )
     find_parser.set_defaults(func=cmd_find)
 
