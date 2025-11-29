@@ -40,8 +40,9 @@ lcls-catalog ls catalog/ /path/to/experiment --dirs
 # List files in a directory
 lcls-catalog ls catalog/ /path/to/experiment/scratch/run0001
 
-# Search for files
+# Search for files (output: path<tab>bytes by default)
 lcls-catalog find catalog/ "%.h5"
+lcls-catalog find catalog/ "%.h5" -H              # human-readable sizes
 lcls-catalog find catalog/ "image_%" --size-gt 1GB
 
 # Show tree structure

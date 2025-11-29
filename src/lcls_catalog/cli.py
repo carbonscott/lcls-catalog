@@ -81,8 +81,9 @@ def cmd_find(args):
             print(f"No files matching '{args.pattern}'")
             return
         for f in results:
-            status = "" if not args.show_status else (" [removed]" if hasattr(f, 'on_disk') and not f.on_disk else "")
-            print(f"{f.path:60} {f.size_human:>15}{status}")
+            size_str = f.size_human if args.human else str(f.size)
+            status = "" if not args.show_status else ("\t[removed]" if hasattr(f, 'on_disk') and not f.on_disk else "")
+            print(f"{f.path}\t{size_str}{status}")
 
 
 def cmd_tree(args):
@@ -228,6 +229,10 @@ def main():
     )
     find_parser.add_argument(
         "--show-status", action="store_true", help="Show [removed] status for removed files"
+    )
+    find_parser.add_argument(
+        "-H", "--human-readable", action="store_true", dest="human",
+        help="Print sizes in human-readable format (e.g., 1.2 GB)"
     )
     find_parser.set_defaults(func=cmd_find)
 
