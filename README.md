@@ -4,11 +4,20 @@ A lightweight catalog for browsing and searching LCLS data metadata after purge.
 
 ## Installation
 
+### With uv (recommended)
+
+```bash
+# Run directly - no install needed
+uv run lcls-catalog --help
+
+# Or install explicitly
+uv pip install -e .
+```
+
+### With pip
+
 ```bash
 pip install -e .
-
-# With Parquet support (parallel processing)
-pip install -e ".[parquet]"
 ```
 
 ## Quick Start
@@ -16,48 +25,40 @@ pip install -e ".[parquet]"
 ### Create a snapshot before purge
 
 ```bash
-# SQLite (default)
-lcls-catalog snapshot /path/to/experiment -e xpp12345 -o catalog.db
+lcls-catalog snapshot /path/to/experiment -e xpp12345 -o catalog/
 
-# Parquet with parallel workers
-lcls-catalog snapshot /path/to/experiment -e xpp12345 -o catalog/ --format parquet --workers 4
+# With parallel workers
+lcls-catalog snapshot /path/to/experiment -e xpp12345 -o catalog/ --workers 4
 ```
 
 ### Browse after purge
 
 ```bash
 # List directories with stats
-lcls-catalog ls catalog.db /path/to/experiment --dirs
+lcls-catalog ls catalog/ /path/to/experiment --dirs
 
 # List files in a directory
-lcls-catalog ls catalog.db /path/to/experiment/scratch/run0001
+lcls-catalog ls catalog/ /path/to/experiment/scratch/run0001
 
 # Search for files
-lcls-catalog find catalog.db "%.h5"
-lcls-catalog find catalog.db "image_%" --size-gt 1GB
+lcls-catalog find catalog/ "%.h5"
+lcls-catalog find catalog/ "image_%" --size-gt 1GB
 
 # Show tree structure
-lcls-catalog tree catalog.db /path/to/experiment --depth 3
+lcls-catalog tree catalog/ /path/to/experiment --depth 3
 
 # Show catalog stats
-lcls-catalog stats catalog.db
-```
-
-For Parquet catalogs, use the directory path instead of `.db` file:
-
-```bash
-lcls-catalog find catalog/ "%.h5"
 lcls-catalog stats catalog/
 ```
 
 ## Python API
 
 ```python
-from lcls_catalog import Catalog
+from lcls_catalog import ParquetCatalog
 
-with Catalog("catalog.db") as cat:
-    # Create snapshot
-    cat.snapshot("/path/to/experiment", experiment="xpp12345")
+with ParquetCatalog("catalog/") as cat:
+    # Create snapshot (with optional parallel workers)
+    cat.snapshot("/path/to/experiment", experiment="xpp12345", workers=4)
 
     # Browse
     for f in cat.ls("/path/to/experiment/scratch/run0001"):
@@ -65,19 +66,6 @@ with Catalog("catalog.db") as cat:
 
     # Search
     results = cat.find("%.h5", size_gt=1_000_000)
-```
-
-### Parquet API (parallel processing)
-
-```python
-from lcls_catalog import ParquetCatalog
-
-with ParquetCatalog("catalog/") as cat:
-    # Parallel snapshot with 4 workers
-    cat.snapshot("/path/to/experiment", experiment="xpp12345", workers=4)
-
-    # Same browse/search API
-    results = cat.find("%.h5")
 ```
 
 ## How Parquet Backend Works
@@ -108,15 +96,19 @@ The `--workers` option uses different strategies based on workload:
 
 ```bash
 # I/O-bound (threads) - good for metadata-only snapshots
-lcls-catalog snapshot /data -o catalog/ --format parquet --workers 16
+lcls-catalog snapshot /data -o catalog/ --workers 16
 
 # CPU-bound (processes) - good for checksum computation
-lcls-catalog snapshot /data -o catalog/ --format parquet --workers 16 --checksum
+lcls-catalog snapshot /data -o catalog/ --workers 16 --checksum
 ```
 
 ## Running Tests
 
 ```bash
+# With uv
+uv run --extra dev pytest
+
+# With pip
 pip install -e ".[dev]"
 pytest
 ```
