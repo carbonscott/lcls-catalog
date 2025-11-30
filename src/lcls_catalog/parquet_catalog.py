@@ -1,19 +1,111 @@
-"""Parquet-based catalog with incremental delta updates."""
+"""Parquet-based catalog with incremental delta updates.
+
+Parallelism Architecture
+========================
+The `--workers` flag controls parallelism in two sequential phases:
+
+  Phase 1: Directory Walking (_parallel_walk)
+  -------------------------------------------
+  - Uses ThreadPoolExecutor to scan multiple directories concurrently
+  - Multiple scandir() calls in flight simultaneously
+  - Benefits: Hides I/O latency on network filesystems
+
+  Phase 2: File Processing (_process_batch)
+  -----------------------------------------
+  - ThreadPoolExecutor for lstat() calls (I/O-bound, GIL released)
+  - ProcessPoolExecutor when --checksum enabled (CPU-bound SHA256)
+
+  Timeline:
+  ┌─────────────────────┐   ┌─────────────────────┐
+  │ Phase 1: Walk dirs  │ → │ Phase 2: Process    │
+  │ (ThreadPool closes) │   │ (Thread/ProcessPool)│
+  └─────────────────────┘   └─────────────────────┘
+
+No conflict between phases - each executor is fully closed before next starts.
+"""
 
 import hashlib
 import os
 import re
 import shutil
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .catalog import DirSummary, FileEntry
+
+
+def _scan_directory(dirpath: str) -> tuple[list[str], list[str]]:
+    """Scan a single directory and return subdirs and files.
+
+    Args:
+        dirpath: Path to directory to scan.
+
+    Returns:
+        Tuple of (subdirectory paths, file paths).
+    """
+    subdirs = []
+    files = []
+    try:
+        with os.scandir(dirpath) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry.path)
+                    else:
+                        files.append(entry.path)
+                except OSError:
+                    # Permission denied or other error
+                    continue
+    except OSError:
+        # Can't read directory
+        pass
+    return subdirs, files
+
+
+def _parallel_walk(root: str, workers: int) -> Iterator[str]:
+    """Walk directory tree in parallel, yielding file paths.
+
+    Uses a thread pool to scan multiple directories concurrently,
+    which can significantly speed up traversal on network filesystems.
+
+    Args:
+        root: Root directory to walk.
+        workers: Number of parallel workers.
+
+    Yields:
+        File paths discovered during traversal.
+    """
+    # Queue of directories to process
+    pending_dirs = deque([root])
+    # Files discovered but not yet yielded
+    pending_files: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        while pending_dirs or pending_files:
+            # Submit batch of directory scans
+            futures = []
+            batch_size = min(len(pending_dirs), workers * 2)
+            for _ in range(batch_size):
+                if pending_dirs:
+                    dirpath = pending_dirs.popleft()
+                    futures.append(executor.submit(_scan_directory, dirpath))
+
+            # Process results as they complete
+            for future in futures:
+                subdirs, files = future.result()
+                pending_dirs.extend(subdirs)
+                pending_files.extend(files)
+
+            # Yield files in batches to avoid memory buildup
+            while pending_files:
+                yield pending_files.pop()
 
 
 def _process_file(args: tuple) -> Optional[dict]:
@@ -179,10 +271,16 @@ class ParquetCatalog:
         current_files = {}
         file_args = []
 
-        for dirpath, _, filenames in os.walk(root_path):
-            for fname in filenames:
-                fpath = str(Path(dirpath) / fname)
+        if workers > 1:
+            # Use parallel directory walking for better performance
+            for fpath in _parallel_walk(root_str, workers):
                 file_args.append((fpath, compute_checksum, experiment, timestamp))
+        else:
+            # Fall back to sequential walk for single worker
+            for dirpath, _, filenames in os.walk(root_path):
+                for fname in filenames:
+                    fpath = str(Path(dirpath) / fname)
+                    file_args.append((fpath, compute_checksum, experiment, timestamp))
 
         # Process files in batches
         for i in range(0, len(file_args), batch_size):
