@@ -8,17 +8,68 @@
 
 set -e  # Exit on error
 
-# Configuration - modify these paths for your environment
-LCLS_DATA="/sdf/data/lcls/ds"
-OUTPUT_DIR="./catalogs/lcls_parquet"
-LOG_FILE="./catalogs/indexing_parquet.log"
+# --- Environment variable checks ---
+if [[ -z "$LCLS_CATALOG_APP_DIR" ]]; then
+    echo "Error: LCLS_CATALOG_APP_DIR environment variable is not set" >&2
+    echo "Please set it to the path of the lcls-catalog project:" >&2
+    echo "  export LCLS_CATALOG_APP_DIR=/path/to/proj-lcls-catalog" >&2
+    exit 1
+fi
 
-# Parallelism settings
-MAX_PARALLEL=4   # Number of experiments to process concurrently
-WORKERS=4        # Threads per experiment (4 experiments × 4 workers = 16 total)
+LCLS_DATA="${LCLS_DATA:-/sdf/data/lcls/ds}"
 
-# Hutches to process (lowercase only, excluding uppercase symlinks)
+# --- Default values ---
+MAX_PARALLEL=128
+WORKERS=4
 HUTCHES="amo cxi mec mfx tmo ued rix det mob prj"
+OUTPUT_DIR=""
+
+# --- Usage ---
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") -o OUTPUT_DIR [-p MAX_PARALLEL] [-w WORKERS] [-H HUTCHES]
+
+Index LCLS experiment folders to Parquet catalog format.
+
+Required:
+  -o OUTPUT_DIR    Directory to write parquet catalog files
+
+Optional:
+  -p MAX_PARALLEL  Number of experiments to process concurrently (default: $MAX_PARALLEL)
+  -w WORKERS       Threads per experiment (default: $WORKERS)
+  -H HUTCHES       Space-separated list of hutches to process
+                   (default: "$HUTCHES")
+
+Environment variables:
+  LCLS_CATALOG_APP_DIR  Path to lcls-catalog project (required)
+  LCLS_DATA         Path to LCLS data directory (default: /sdf/data/lcls/ds)
+
+Examples:
+  $(basename "$0") -o ./catalogs/lcls_parquet
+  $(basename "$0") -o ./catalogs/lcls_parquet -p 64 -w 8
+  $(basename "$0") -o ./catalogs/lcls_parquet -H "amo cxi"
+EOF
+    exit 1
+}
+
+# --- Parse arguments ---
+while getopts "o:p:w:H:" opt; do
+    case $opt in
+        o) OUTPUT_DIR="$OPTARG" ;;
+        p) MAX_PARALLEL="$OPTARG" ;;
+        w) WORKERS="$OPTARG" ;;
+        H) HUTCHES="$OPTARG" ;;
+        *) usage ;;
+    esac
+done
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+    echo "Error: -o OUTPUT_DIR is required" >&2
+    usage
+fi
+
+# Derive log file from output directory
+LOG_FILE="$OUTPUT_DIR/indexing.log"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -35,7 +86,7 @@ run_snapshot() {
     local exp="$2"
     local hutch="$3"
 
-    output=$(lcls-catalog snapshot "$exp_path" \
+    output=$(uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog snapshot "$exp_path" \
       -e "$exp" \
       -o "$OUTPUT_DIR" \
       --workers "$WORKERS" 2>&1) || {
@@ -48,7 +99,7 @@ run_snapshot() {
 }
 
 export -f run_snapshot
-export OUTPUT_DIR WORKERS LOG_FILE
+export OUTPUT_DIR WORKERS LOG_FILE LCLS_CATALOG_APP_DIR
 
 job_count=0
 
@@ -93,4 +144,4 @@ echo "========================================" | tee -a "$LOG_FILE"
 
 echo "" | tee -a "$LOG_FILE"
 echo "Final catalog statistics:" | tee -a "$LOG_FILE"
-lcls-catalog stats "$OUTPUT_DIR" | tee -a "$LOG_FILE"
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog stats "$OUTPUT_DIR" | tee -a "$LOG_FILE"
