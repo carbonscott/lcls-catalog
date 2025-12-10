@@ -159,6 +159,14 @@ cmd_submit() {
     # Source env to ensure UV_CACHE_DIR etc are set
     source "$PROJECT_DIR/env.sh"
 
+    # Source LCLS environment if available (needed for cron - provides sbatch)
+    # Note: Temporarily disable strict mode as psconda.sh uses unset variables
+    if [[ -n "${PSCONDA_SH:-}" && -f "$PSCONDA_SH" ]]; then
+        set +u
+        source "$PSCONDA_SH"
+        set -u
+    fi
+
     job_id=$(sbatch --parsable "$SCRIPT_DIR/catalog_index.sbatch" "$@")
     echo "Submitted job: $job_id"
     echo "Monitor with: squeue -j $job_id"

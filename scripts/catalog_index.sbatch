@@ -16,10 +16,11 @@
 #   sbatch catalog_index.sbatch -- --hutches "prj"
 #   sbatch catalog_index.sbatch -- --dry-run
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Use absolute paths (SCRIPT_DIR doesn't work in Slurm - script is copied to /var/spool)
+PROJECT_DIR=/sdf/scratch/users/c/cwang31/proj-lcls-catalog
 
 # Source environment
-source "$SCRIPT_DIR/../env.sh"
+source "$PROJECT_DIR/env.sh"
 
 echo "Starting catalog indexing on $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
@@ -27,6 +28,6 @@ echo "CPUs: $SLURM_CPUS_PER_TASK"
 echo "Arguments: $*"
 
 # Run the indexer with any passed arguments
-"$SCRIPT_DIR/run_catalog_index.sh" "$@"
+"$PROJECT_DIR/scripts/run_catalog_index.sh" "$@"
 
 echo "Job complete"

@@ -15,3 +15,6 @@ export UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/
 # export CRON_NODE=sdfcron001           # Node where cron runs
 # export CRON_SCHEDULE="0 2 * * *"      # Schedule: daily at 2am
 # export CRON_LOG="$CATALOG_DATA_DIR/cron.log"
+
+# LCLS environment (provides sbatch in PATH for cron)
+export PSCONDA_SH=/sdf/group/lcls/ds/ana/sw/conda1/manage/bin/psconda.sh
