@@ -25,7 +25,7 @@ fi
 
 # Configuration (override via environment variables)
 CRON_NODE="${CRON_NODE:-sdfcron001}"
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 2 * * *}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 1 * * *}"
 CRON_LOG="${CRON_LOG:-$CATALOG_DATA_DIR/cron.log}"
 CRON_MARKER="catalog-cron.sh"
 
@@ -162,9 +162,9 @@ cmd_submit() {
     # Source LCLS environment if available (needed for cron - provides sbatch)
     # Note: Temporarily disable strict mode as psconda.sh uses unset variables
     if [[ -n "${PSCONDA_SH:-}" && -f "$PSCONDA_SH" ]]; then
-        set +u
+        set +eu
         source "$PSCONDA_SH"
-        set -u
+        set -eu
     fi
 
     job_id=$(sbatch --parsable "$SCRIPT_DIR/catalog_index.sbatch" "$@")
