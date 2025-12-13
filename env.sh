@@ -2,6 +2,9 @@
 # Source this file before running lcls-catalog with uv:
 #   source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
 
+# Add uv to PATH (needed for Slurm nodes)
+export PATH="$HOME/.local/bin:$PATH"
+
 # Path to the lcls-catalog project (for uv run --project)
 export LCLS_CATALOG_APP_DIR=/sdf/scratch/users/c/cwang31/proj-lcls-catalog
 
