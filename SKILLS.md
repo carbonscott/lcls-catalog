@@ -75,6 +75,20 @@ You can verify it works with:
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog --help
 ```
 
+### 4. Using the `lcat` shorthand
+
+After sourcing `env.sh`, you can use the `lcat` function for simpler commands:
+
+| Long form | Short form (`lcat`) |
+|-----------|---------------------|
+| `uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog stats "$CATALOG_DATA_DIR"` | `lcat stats` |
+| `uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog find "$CATALOG_DATA_DIR" "%.h5" -H` | `lcat find "%.h5" -H` |
+| `uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query "$CATALOG_DATA_DIR" "SELECT..."` | `lcat query "SELECT..."` |
+
+The `lcat` wrapper automatically:
+- Uses `$CATALOG_DATA_DIR` for read commands (find, query, ls, stats, tree, consolidate, snapshots)
+- Adds `-o $CATALOG_DATA_DIR` for snapshot commands
+
 ---
 
 ## Command Reference
@@ -523,24 +537,26 @@ source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
 # Setup
 source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
 
-# Create snapshot
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog snapshot /path -e exp -o "$CATALOG_DATA_DIR" --workers 4
+# Long form                                                      # lcat shorthand
+# ---------                                                      # --------------
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  snapshot /path -e exp -o "$CATALOG_DATA_DIR" --workers 4       # lcat snapshot /path -e exp --workers 4
 
-# List files
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog ls "$CATALOG_DATA_DIR" /path
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  ls "$CATALOG_DATA_DIR" /path                                   # lcat ls /path
 
-# List directories
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog ls "$CATALOG_DATA_DIR" /path --dirs
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  ls "$CATALOG_DATA_DIR" /path --dirs                            # lcat ls /path --dirs
 
-# Find files
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog find "$CATALOG_DATA_DIR" "%.h5" -H
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  find "$CATALOG_DATA_DIR" "%.h5" -H                             # lcat find "%.h5" -H
 
-# Find large files
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog find "$CATALOG_DATA_DIR" "%.h5" --size-gt 1GB -H
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  find "$CATALOG_DATA_DIR" "%.h5" --size-gt 1GB -H               # lcat find "%.h5" --size-gt 1GB -H
 
-# Show stats
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog stats "$CATALOG_DATA_DIR"
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  stats "$CATALOG_DATA_DIR"                                      # lcat stats
 
-# Run SQL query
-uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query "$CATALOG_DATA_DIR" "SELECT * FROM files LIMIT 10"
+uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog \
+  query "$CATALOG_DATA_DIR" "SELECT * FROM files LIMIT 10"       # lcat query "SELECT * FROM files LIMIT 10"
 ```

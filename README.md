@@ -52,6 +52,20 @@ lcls-catalog tree catalog/ /path/to/experiment --depth 3
 lcls-catalog stats catalog/
 ```
 
+### Using `lcat` shorthand (LCLS environment)
+
+For LCLS users, source `env.sh` to get the `lcat` shorthand which auto-injects paths:
+
+```bash
+source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+
+lcat stats                       # Show catalog statistics
+lcat find "%.h5" -H              # Find HDF5 files
+lcat find "%.h5" --size-gt 1GB   # Find large files
+lcat query "SELECT ..."          # Run SQL query
+lcat snapshot /path -e exp       # Create snapshot
+```
+
 ## Python API
 
 ```python
