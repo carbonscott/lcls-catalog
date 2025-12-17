@@ -48,7 +48,7 @@ LCLS data is organized by **hutches** (beamline areas) and **experiments**:
 Before using `lcls-catalog`, source the environment file:
 
 ```bash
-source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+source ./env.sh
 ```
 
 ### 2. Environment variables
@@ -414,7 +414,7 @@ mfx67890/
 
 ```bash
 # 1. Set up environment
-source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+source ./env.sh
 
 # 2. Snapshot the experiment with parallel workers
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog snapshot \
@@ -528,14 +528,14 @@ Error: LCLS_CATALOG_APP_DIR environment variable is not set
 ```
 Solution: Source the environment file first:
 ```bash
-source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+source ./env.sh
 ```
 
 ### Quick reference card
 
 ```bash
 # Setup
-source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+source ./env.sh
 
 # Long form                                                      # lcat shorthand
 # ---------                                                      # --------------

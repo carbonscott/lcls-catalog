@@ -37,6 +37,21 @@ uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog find "$CATALOG_DATA_DIR" "
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog stats "$CATALOG_DATA_DIR"
 ```
 
+### Using `lcat` shorthand
+
+The `lcat` function (defined in `env.sh`) provides a simpler interface:
+
+```bash
+lcat stats                                  # Show catalog statistics
+lcat find "%.h5" -H                         # Find HDF5 files
+lcat find "%.h5" --size-gt 1GB -H           # Find large files
+lcat query "SELECT * FROM files LIMIT 10"   # Run SQL query
+lcat ls /path/to/dir                        # List files
+lcat snapshot /path -e exp_name             # Create snapshot (auto -o)
+```
+
+The wrapper automatically uses `$CATALOG_DATA_DIR` for read commands and adds `-o $CATALOG_DATA_DIR` for snapshots.
+
 ## Batch Indexing
 
 Index all LCLS experiments using the batch script:
