@@ -2,7 +2,7 @@
 #SBATCH --job-name=catalog-index
 #SBATCH --partition=milano
 #SBATCH --account=lcls:prjdat21
-#SBATCH --time=06:00:00
+#SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=32
 #SBATCH --output=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/slurm_%j.log
 

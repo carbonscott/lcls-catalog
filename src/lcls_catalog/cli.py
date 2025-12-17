@@ -9,7 +9,7 @@ from .parquet_catalog import ParquetCatalog
 def parse_size(size_str: str) -> int:
     """Parse a human-readable size string (e.g., '1GB', '500MB') to bytes."""
     size_str = size_str.strip().upper()
-    units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    units = {"PB": 1024**5, "TB": 1024**4, "GB": 1024**3, "MB": 1024**2, "KB": 1024, "B": 1}
 
     for unit, multiplier in units.items():
         if size_str.endswith(unit):
