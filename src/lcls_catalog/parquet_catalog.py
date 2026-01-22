@@ -603,6 +603,29 @@ class ParquetCatalog:
         result = self._query_with_dedup(sql)
         return result[0][0] if result else 0
 
+    def get_stats(self) -> dict:
+        """Return catalog statistics in a single query.
+
+        Returns:
+            Dictionary with keys: total_count, on_disk_count, total_size, on_disk_size
+        """
+        sql = """
+            SELECT
+                COUNT(*) as total_count,
+                SUM(CASE WHEN on_disk THEN 1 ELSE 0 END) as on_disk_count,
+                COALESCE(SUM(size), 0) as total_size,
+                COALESCE(SUM(CASE WHEN on_disk THEN size ELSE 0 END), 0) as on_disk_size
+            FROM files
+        """
+        result = self._query_with_dedup(sql)
+        row = result[0] if result else (0, 0, 0, 0)
+        return {
+            "total_count": row[0],
+            "on_disk_count": row[1],
+            "total_size": row[2],
+            "on_disk_size": row[3],
+        }
+
     def query(self, sql: str) -> list[tuple]:
         """
         Execute a raw SQL query on the catalog.

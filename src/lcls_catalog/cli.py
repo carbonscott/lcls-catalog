@@ -97,10 +97,12 @@ def cmd_tree(args):
 def cmd_stats(args):
     """Handle the stats command."""
     with ParquetCatalog(args.db) as cat:
-        total_count = cat.count()
-        on_disk_count = cat.count(on_disk_only=True)
-        total_size = cat.total_size()
-        on_disk_size = cat.total_size(on_disk_only=True)
+        stats = cat.get_stats()
+
+        total_count = stats["total_count"]
+        on_disk_count = stats["on_disk_count"]
+        total_size = stats["total_size"]
+        on_disk_size = stats["on_disk_size"]
 
         # Format sizes
         def format_size(size):
