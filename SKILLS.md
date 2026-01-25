@@ -307,12 +307,20 @@ lcls-catalog query <catalog_dir> "<sql>"
 
 **Available columns:**
 - `path`, `parent_path`, `filename`
-- `size`, `mtime`
+- `size`, `mtime` (Unix epoch seconds)
 - `owner`, `group_name`, `permissions`
 - `checksum` (if computed)
 - `experiment`, `run`
 - `on_disk` (boolean)
 - `indexed_at`
+
+**Tip: Querying by date**
+
+The `mtime` column is stored as Unix epoch seconds (integer). To filter by date, use epoch values:
+```bash
+# Convert a date to epoch: date -d "2026-01-01" +%s → 1767225600
+# Then use in query: WHERE mtime >= 1767225600
+```
 
 **Examples:**
 
@@ -327,10 +335,11 @@ uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
   "$CATALOG_DATA_DIR" \
   "SELECT experiment, COUNT(*) as count, SUM(size)/1e9 as gb FROM files GROUP BY experiment ORDER BY gb DESC LIMIT 20"
 
-# Find files modified in the last 30 days
+# Find files modified since a specific date (use epoch timestamp)
+# Convert date to epoch: date -d "2026-01-01" +%s → 1767225600
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
   "$CATALOG_DATA_DIR" \
-  "SELECT path, size FROM files WHERE mtime > now() - INTERVAL '30 days'"
+  "SELECT path, size/1e9 as gb FROM files WHERE mtime >= 1767225600 ORDER BY mtime DESC LIMIT 20"
 
 # Find largest files
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
