@@ -34,7 +34,7 @@ fi
 
 # --- Default values ---
 LCLS_DATA="${LCLS_DATA:-/sdf/data/lcls/ds}"
-HUTCHES="amo cxi mec mfx tmo ued rix det mob prj"
+HUTCHES="amo cxi mec mfx tmo ued rix xcs det mob prj"
 WORKERS=4
 MAX_PARALLEL=128
 DRY_RUN=false

@@ -2,7 +2,7 @@
 #SBATCH --job-name=catalog-index
 #SBATCH --partition=milano
 #SBATCH --account=lcls:prjdat21
-#SBATCH --time=08:00:00
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=32
 #SBATCH --output=slurm_%j.log
 
