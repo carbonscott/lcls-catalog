@@ -4,7 +4,7 @@
 #SBATCH --account=lcls:prjdat21
 #SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=32
-#SBATCH --output=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/slurm_%j.log
+#SBATCH --output=slurm_%j.log
 
 # LCLS Catalog Indexing - Slurm Batch Job
 #
@@ -17,7 +17,7 @@
 #   sbatch catalog_index.sbatch -- --dry-run
 
 # Use absolute paths (SCRIPT_DIR doesn't work in Slurm - script is copied to /var/spool)
-PROJECT_DIR=/sdf/scratch/users/c/cwang31/proj-lcls-catalog
+PROJECT_DIR="${LCLS_CATALOG_APP_DIR:?LCLS_CATALOG_APP_DIR not set - source env.sh first}"
 
 # Source environment
 source "$PROJECT_DIR/env.sh"

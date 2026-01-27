@@ -57,9 +57,9 @@ This sets three key variables:
 
 | Variable | Purpose | Example Value |
 |----------|---------|---------------|
-| `LCLS_CATALOG_APP_DIR` | Path to lcls-catalog project | `/sdf/scratch/users/c/cwang31/proj-lcls-catalog` |
-| `CATALOG_DATA_DIR` | Directory for catalog parquet files | `/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/` |
-| `UV_CACHE_DIR` | UV package cache location | `.../.uv-cache` |
+| `LCLS_CATALOG_APP_DIR` | Path to lcls-catalog project | Set in `env.sh` |
+| `CATALOG_DATA_DIR` | Directory for catalog parquet files | Set in `env.sh` |
+| `UV_CACHE_DIR` | UV package cache location | `$LCLS_CATALOG_APP_DIR/.uv-cache` |
 
 ### 3. Running commands
 

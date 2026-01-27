@@ -1,18 +1,23 @@
 # lcls-catalog environment setup
 # Source this file before running lcls-catalog with uv:
-#   source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+#   source <project-dir>/env.sh
 
 # Add uv to PATH (needed for Slurm nodes)
 export PATH="$HOME/.local/bin:$PATH"
 
-# Path to the lcls-catalog project (for uv run --project)
-export LCLS_CATALOG_APP_DIR=/sdf/scratch/users/c/cwang31/proj-lcls-catalog
+# Auto-detect project directory from this script's location
+export LCLS_CATALOG_APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Directory where catalog parquet files are stored
+# Default catalog data directory (override in env.local)
 export CATALOG_DATA_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/
 
+# Source local overrides if present (e.g., CATALOG_DATA_DIR for deployments)
+if [[ -f "$LCLS_CATALOG_APP_DIR/env.local" ]]; then
+    source "$LCLS_CATALOG_APP_DIR/env.local"
+fi
+
 # UV cache directory (persistent across sessions)
-export UV_CACHE_DIR=/sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/.uv-cache
+export UV_CACHE_DIR="$LCLS_CATALOG_APP_DIR/.uv-cache"
 
 # Cron configuration (optional - uncomment to override defaults)
 # export CRON_NODE=sdfcron001           # Node where cron runs

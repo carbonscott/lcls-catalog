@@ -162,10 +162,10 @@ cmd_submit() {
     # Add slurm to PATH (cron has minimal PATH that doesn't include slurm)
     export PATH="/opt/slurm/slurm-curr/bin:$PATH"
 
-    job_id=$(sbatch --parsable "$SCRIPT_DIR/catalog_index.sbatch" "$@")
+    job_id=$(sbatch --parsable --output="$CATALOG_DATA_DIR/slurm_%j.log" "$SCRIPT_DIR/catalog_index.sbatch" "$@")
     echo "Submitted job: $job_id"
     echo "Monitor with: squeue -j $job_id"
-    echo "Log file: /sdf/data/lcls/ds/prj/prjdat21/results/cwang31/lcls_parquet/slurm_${job_id}.log"
+    echo "Log file: ${CATALOG_DATA_DIR}/slurm_${job_id}.log"
 }
 
 cmd_test() {
