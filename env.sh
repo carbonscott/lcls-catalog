@@ -2,8 +2,8 @@
 # Source this file before running lcls-catalog with uv:
 #   source <project-dir>/env.sh
 
-# Add uv to PATH (needed for Slurm nodes)
-export PATH="$HOME/.local/bin:$PATH"
+# Add shared uv to PATH (needed for Slurm nodes and users without personal uv)
+export PATH="/sdf/group/lcls/ds/dm/apps/dev/bin:$PATH"
 
 # Auto-detect project directory from this script's location
 export LCLS_CATALOG_APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
