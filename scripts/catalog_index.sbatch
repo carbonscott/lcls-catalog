@@ -4,6 +4,9 @@
 #SBATCH --account=lcls:prjdat21
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=32
+# Reserve memory: milano has no per-CPU default, and unreserved memory let
+# the node's OOM killer take snapshots (Sep-Oct 2026).
+#SBATCH --mem=128G
 #SBATCH --output=slurm_%j.log
 
 # LCLS Catalog Indexing - Slurm Batch Job

@@ -1,7 +1,9 @@
 """Tests for the materialized current state under <catalog>/_state/current."""
 
+import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -239,3 +241,62 @@ class TestDirs:
     def test_empty_catalog_dirs(self, tmp_path):
         with ParquetCatalog(str(tmp_path / "cat")) as cat:
             assert cat.query("SELECT * FROM dirs") == []
+
+
+class TestStreamingSnapshot:
+
+    def test_mixed_delta_rows(self, fake_experiment, tmp_path):
+        """One snapshot that adds, modifies, removes and restores at once."""
+        exp_path = fake_experiment.experiment_path
+        catalog = tmp_path / "cat"
+        with ParquetCatalog(str(catalog)) as cat:
+            cat.snapshot(str(exp_path), experiment="xpptest01")
+            gone = exp_path / "results" / "analysis.npz"
+            gone.unlink()
+            cat.snapshot(str(exp_path), experiment="xpptest01")
+
+            gone.write_bytes(b"g" * 256)                                   # restored
+            (exp_path / "results" / "fresh.h5").write_bytes(b"f")          # added
+            (exp_path / "calib" / "calibration.dat").write_bytes(b"c" * 5)  # modified
+            (exp_path / "scratch" / "run0002" / "data.h5").unlink()        # removed
+            assert cat.snapshot(str(exp_path), experiment="xpptest01") == (2, 1, 1)
+
+            newest = sorted((catalog / "xpptest01").glob("delta_*.parquet"))[-1]
+            rows = dict(duckdb.execute(
+                f"SELECT filename, status FROM read_parquet('{newest}')").fetchall())
+            assert rows == {"analysis.npz": "added", "fresh.h5": "added",
+                            "calibration.dat": "modified", "data.h5": "removed"}
+            removed = duckdb.execute(
+                f"SELECT size, on_disk FROM read_parquet('{newest}') WHERE status = 'removed'").fetchone()
+            assert removed == (512, None)  # keeps the previous size; on_disk unset in deltas
+
+    def test_no_temp_files_left(self, fake_experiment, tmp_path):
+        catalog = tmp_path / "cat"
+        with ParquetCatalog(str(catalog)) as cat:
+            for _ in history(cat, fake_experiment.experiment_path):
+                pass
+        assert not list(catalog.rglob("*.tmp"))
+
+    def test_stale_temp_files_are_removed(self, fake_experiment, tmp_path):
+        catalog = tmp_path / "cat"
+        stale = catalog / "xpptest01" / "walk_old.parquet.tmp"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"x")
+        recent = catalog / "xpptest01" / "walk_running.parquet.tmp"
+        recent.write_bytes(b"x")
+        old = time.time() - 2 * 24 * 3600
+        os.utime(stale, (old, old))
+        with ParquetCatalog(str(catalog)) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path), experiment="xpptest01")
+        assert not stale.exists()
+        assert recent.exists()  # may belong to a snapshot still running
+
+    def test_empty_walk_after_files_existed(self, fake_experiment, tmp_path):
+        exp_path = fake_experiment.experiment_path
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            cat.snapshot(str(exp_path), experiment="xpptest01")
+            shutil.rmtree(exp_path)
+            exp_path.mkdir()
+            n = fake_experiment.expected_file_count
+            assert cat.snapshot(str(exp_path), experiment="xpptest01") == (0, 0, n)
+            assert cat.count(on_disk_only=True) == 0
