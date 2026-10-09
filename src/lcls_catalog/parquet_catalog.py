@@ -26,7 +26,9 @@ No conflict between phases - each executor is fully closed before next starts.
 
 import glob
 import hashlib
+import itertools
 import os
+import time
 import re
 import shutil
 import sys
@@ -149,6 +151,22 @@ def _snapshot_inputs(exp_dir: Path) -> list[Path]:
 
 def _sql_list(paths) -> str:
     return "[" + ", ".join(f"'{p}'" for p in paths) + "]"
+
+
+# Memory cap for snapshot's DuckDB steps (diff, base copy); the OOM retry
+# in _copy_to_parquet steps down from here.
+SNAPSHOT_MEMORY = os.environ.get("LCAT_SNAPSHOT_MEMORY", "4GB")
+
+
+def _remove_stale_tmp(directory: Path, max_age_s: float = 24 * 3600):
+    """Delete *.tmp files a killed snapshot or refresh left behind."""
+    cutoff = time.time() - max_age_s
+    for p in directory.glob("*.tmp"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
 
 
 class QueryLimitError(RuntimeError):
@@ -316,6 +334,9 @@ class ParquetCatalog:
         ("status", pa.string()),      # Set in delta files ("added"/"modified"/"removed"), NULL in base
     ])
 
+    # What the walk records per file; on_disk/status are added when written
+    WALK_SCHEMA = pa.schema([f for f in SCHEMA if f.name not in ("on_disk", "status")])
+
     def __init__(self, catalog_dir: str, limits: Optional[QueryLimits] = None):
         """
         Initialize a Parquet catalog.
@@ -401,6 +422,10 @@ class ParquetCatalog:
         """
         Walk a directory tree and capture metadata, creating base or delta.
 
+        The walk streams to a temporary Parquet file and the diff against the
+        previous state runs in DuckDB, so memory stays flat however many files
+        the experiment has.
+
         Args:
             root: Root directory to snapshot.
             experiment: Optional experiment identifier.
@@ -415,38 +440,21 @@ class ParquetCatalog:
         root_path = Path(root).resolve()
         root_str = str(root_path)
         exp_dir = self._get_exp_dir(root_str, experiment)
+        _remove_stale_tmp(exp_dir)
 
-        # Walk directory to get current files
-        current_files = {}
-        file_args = []
-
-        if workers > 1:
-            # Use parallel directory walking for better performance
-            for fpath in _parallel_walk(root_str, workers):
-                file_args.append((fpath, compute_checksum, experiment, timestamp))
-        else:
-            # Fall back to sequential walk for single worker
-            for dirpath, _, filenames in os.walk(root_path):
-                for fname in filenames:
-                    fpath = str(Path(dirpath) / fname)
-                    file_args.append((fpath, compute_checksum, experiment, timestamp))
-
-        # Process files in batches
-        for i in range(0, len(file_args), batch_size):
-            batch = file_args[i:i + batch_size]
-            records = self._process_batch(batch, workers, compute_checksum)
-            for rec in records:
-                current_files[rec["path"]] = rec
-
-        # Load previous state
-        previous_state = self.load_current_state(exp_dir)
-
-        if not previous_state:
-            # First run: create base snapshot
-            result = self._write_base(exp_dir, timestamp, current_files)
-        else:
-            # Compute delta
-            result = self._write_delta(exp_dir, timestamp, current_files, previous_state)
+        walk_file = exp_dir / f"walk_{timestamp}.parquet.tmp"
+        try:
+            count = self._walk_to_parquet(
+                root_path, walk_file, experiment, timestamp,
+                compute_checksum, workers, batch_size)
+            if self._find_latest_base(exp_dir) is None:
+                # First run: create base snapshot
+                result = self._write_base(exp_dir, timestamp, walk_file, count)
+            else:
+                # Compute delta
+                result = self._write_delta(exp_dir, timestamp, walk_file, count)
+        finally:
+            walk_file.unlink(missing_ok=True)
 
         # Runs even when nothing changed, so a missing current file heals itself.
         try:
@@ -456,89 +464,91 @@ class ParquetCatalog:
                   f"{exp_dir.name}: {e}", file=sys.stderr)
         return result
 
-    def _write_base(self, exp_dir: Path, timestamp: str, files: dict[str, dict]) -> tuple[int, int, int]:
-        """Write a base snapshot file."""
-        records = []
-        for rec in files.values():
-            rec["on_disk"] = True
-            rec["status"] = None  # Base files don't have status
-            records.append(rec)
+    def _walk_to_parquet(
+        self, root_path: Path, walk_file: Path, experiment: Optional[str],
+        timestamp: str, compute_checksum: bool, workers: int, batch_size: int,
+    ) -> int:
+        """Stat every file under root_path into walk_file; return the file count."""
+        if workers > 1:
+            # Use parallel directory walking for better performance
+            paths = _parallel_walk(str(root_path), workers)
+        else:
+            # Fall back to sequential walk for single worker
+            paths = (str(Path(dirpath) / fname)
+                     for dirpath, _, filenames in os.walk(root_path)
+                     for fname in filenames)
 
-        if not records:
+        writer = None
+        count = 0
+        try:
+            while True:
+                batch = [(fpath, compute_checksum, experiment, timestamp)
+                         for fpath in itertools.islice(paths, batch_size)]
+                if not batch:
+                    break
+                records = self._process_batch(batch, workers, compute_checksum)
+                if not records:
+                    continue
+                if writer is None:
+                    writer = pq.ParquetWriter(walk_file, self.WALK_SCHEMA)
+                writer.write_table(pa.Table.from_pylist(records, schema=self.WALK_SCHEMA))
+                count += len(records)
+        finally:
+            if writer is not None:
+                writer.close()
+        return count
+
+    def _write_base(self, exp_dir: Path, timestamp: str, walk_file: Path, count: int) -> tuple[int, int, int]:
+        """Write a base snapshot file."""
+        if not count:
             return (0, 0, 0)
 
         output_path = exp_dir / f"base_{timestamp}.parquet"
         temp_path = output_path.with_suffix('.parquet.tmp')
-        table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-        pq.write_table(table, temp_path)
+        # Base files have on_disk set and no status
+        self._copy_to_parquet(
+            f"SELECT *, true AS on_disk, NULL::VARCHAR AS status FROM read_parquet('{walk_file}')",
+            temp_path, memory_limit=SNAPSHOT_MEMORY, threads=4)
         temp_path.rename(output_path)  # Atomic rename
 
-        return (len(records), 0, 0)
+        return (count, 0, 0)
 
-    def _write_delta(
-        self,
-        exp_dir: Path,
-        timestamp: str,
-        current_files: dict[str, dict],
-        previous_state: dict[str, dict],
-    ) -> tuple[int, int, int]:
-        """Compute and write a delta file."""
-        delta_records = []
-        added = 0
-        modified = 0
-        removed = 0
+    def _write_delta(self, exp_dir: Path, timestamp: str, walk_file: Path, count: int) -> tuple[int, int, int]:
+        """Compute and write a delta file against the materialized current state."""
+        self.refresh_current(exp_dir)
+        prev = self._state_versions("current", exp_dir.name)[exp_dir.name][-1][1]
+        new = (f"read_parquet('{walk_file}')" if count  # empty walk: no walk file written
+               else f"(SELECT {COLUMNS} FROM read_parquet('{prev}') WHERE false)")
 
-        # Find added/modified files
-        for path, meta in current_files.items():
-            if path not in previous_state:
-                delta_records.append({**meta, "status": "added", "on_disk": None})
-                added += 1
-            elif not previous_state[path].get("on_disk", True):
-                # File was removed but now exists again (restored)
-                delta_records.append({**meta, "status": "added", "on_disk": None})
-                added += 1
-            elif self._file_changed(meta, previous_state[path]):
-                delta_records.append({**meta, "status": "modified", "on_disk": None})
-                modified += 1
-
-        # Find removed files (only those that were on_disk=True)
-        for path, prev_rec in previous_state.items():
-            if path not in current_files and prev_rec.get("on_disk", True):
-                delta_records.append({
-                    "path": path,
-                    "parent_path": prev_rec.get("parent_path", ""),
-                    "filename": prev_rec.get("filename", ""),
-                    "size": prev_rec.get("size"),
-                    "mtime": prev_rec.get("mtime"),
-                    "owner": prev_rec.get("owner"),
-                    "group_name": prev_rec.get("group_name"),
-                    "permissions": prev_rec.get("permissions"),
-                    "checksum": prev_rec.get("checksum"),
-                    "experiment": prev_rec.get("experiment"),
-                    "run": prev_rec.get("run"),
-                    "indexed_at": timestamp,
-                    "status": "removed",
-                    "on_disk": None,
-                })
-                removed += 1
-
-        if not delta_records:
-            return (0, 0, 0)
+        # added: new path, or a path that was removed and is back (restored).
+        # modified: on disk before and now, with a different size or mtime.
+        # removed: on disk before, gone now; keeps its previous metadata.
+        delta_sql = f"""
+            SELECT n.*, NULL::BOOLEAN AS on_disk, 'added' AS status
+            FROM {new} n LEFT JOIN read_parquet('{prev}') p ON n.path = p.path
+            WHERE p.path IS NULL OR NOT p.on_disk
+            UNION ALL
+            SELECT n.*, NULL::BOOLEAN AS on_disk, 'modified' AS status
+            FROM {new} n JOIN read_parquet('{prev}') p ON n.path = p.path
+            WHERE p.on_disk AND (n.size IS DISTINCT FROM p.size OR n.mtime IS DISTINCT FROM p.mtime)
+            UNION ALL
+            SELECT p.path, p.parent_path, p.filename, p.size, p.mtime, p.owner,
+                   p.group_name, p.permissions, p.checksum, p.experiment, p.run,
+                   '{timestamp}' AS indexed_at, NULL::BOOLEAN AS on_disk, 'removed' AS status
+            FROM read_parquet('{prev}') p ANTI JOIN {new} n ON p.path = n.path
+            WHERE p.on_disk"""
 
         output_path = exp_dir / f"delta_{timestamp}.parquet"
         temp_path = output_path.with_suffix('.parquet.tmp')
-        table = pa.Table.from_pylist(delta_records, schema=self.SCHEMA)
-        pq.write_table(table, temp_path)
+        self._copy_to_parquet(delta_sql, temp_path, memory_limit=SNAPSHOT_MEMORY, threads=4)
+        counts = dict(duckdb.execute(
+            f"SELECT status, COUNT(*) FROM read_parquet('{temp_path}') GROUP BY status").fetchall())
+        if not counts:
+            temp_path.unlink()
+            return (0, 0, 0)
         temp_path.rename(output_path)  # Atomic rename
 
-        return (added, modified, removed)
-
-    def _file_changed(self, current: dict, previous: dict) -> bool:
-        """Check if a file has changed based on size or mtime."""
-        return (
-            current.get("size") != previous.get("size") or
-            current.get("mtime") != previous.get("mtime")
-        )
+        return (counts.get("added", 0), counts.get("modified", 0), counts.get("removed", 0))
 
     def _process_batch(
         self, batch: list[tuple], workers: int, compute_checksum: bool
@@ -558,14 +568,6 @@ class ParquetCatalog:
         """Experiment directories (skips _state and hidden dirs)."""
         return sorted(p for p in self.catalog_dir.iterdir()
                       if p.is_dir() and not p.name.startswith(("_", ".")))
-
-    def _get_all_current_state(self) -> dict[str, dict]:
-        """Load current state from all experiments."""
-        all_state = {}
-        for exp_dir in self._exp_dirs():
-            state = self.load_current_state(exp_dir)
-            all_state.update(state)
-        return all_state
 
     # --- Materialized state ---------------------------------------------
     #
@@ -601,6 +603,7 @@ class ParquetCatalog:
         """Write one materialized file atomically and prune old versions."""
         state_dir = self.catalog_dir / STATE_DIR / kind
         state_dir.mkdir(parents=True, exist_ok=True)
+        _remove_stale_tmp(state_dir)
         dst = state_dir / f"{exp}__{source}.parquet"
         tmp = dst.with_name(dst.name + ".tmp")
         self._copy_to_parquet(select, tmp, memory_limit, threads)
