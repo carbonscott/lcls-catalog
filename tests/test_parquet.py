@@ -14,6 +14,11 @@ pytest.importorskip("duckdb")
 from lcls_catalog.parquet_catalog import ParquetCatalog
 
 
+def exp_dirs(catalog_dir):
+    """Experiment directories of a catalog (skips the _state dir)."""
+    return [p for p in Path(catalog_dir).iterdir() if not p.name.startswith("_")]
+
+
 @pytest.fixture
 def parquet_catalog_dir(tmp_path):
     """Return a path for a test Parquet catalog directory."""
@@ -36,10 +41,10 @@ class TestBaseSnapshot:
             assert removed == 0
 
             # Check base file was created
-            exp_dirs = list(parquet_catalog_dir.iterdir())
-            assert len(exp_dirs) == 1
+            dirs = exp_dirs(parquet_catalog_dir)
+            assert len(dirs) == 1
 
-            base_files = list(exp_dirs[0].glob("base_*.parquet"))
+            base_files = list(dirs[0].glob("base_*.parquet"))
             assert len(base_files) == 1
 
     def test_snapshot_captures_correct_count(self, fake_experiment, parquet_catalog_dir):
@@ -70,7 +75,7 @@ class TestDeltaUpdates:
             # First snapshot
             cat.snapshot(str(fake_experiment.experiment_path))
 
-            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            exp_dir = exp_dirs(parquet_catalog_dir)[0]
             initial_files = list(exp_dir.glob("*.parquet"))
 
             # Second snapshot (no changes)
@@ -104,7 +109,7 @@ class TestDeltaUpdates:
             assert cat.count() == initial_count + 1
 
             # Check delta file was created
-            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            exp_dir = exp_dirs(parquet_catalog_dir)[0]
             delta_files = list(exp_dir.glob("delta_*.parquet"))
             assert len(delta_files) == 1
 
@@ -229,7 +234,7 @@ class TestConsolidate:
             (fake_experiment.experiment_path / "new2.txt").write_text("new")
             cat.snapshot(str(fake_experiment.experiment_path))
 
-            exp_dir = list(parquet_catalog_dir.iterdir())[0]
+            exp_dir = exp_dirs(parquet_catalog_dir)[0]
             files_before = list(exp_dir.glob("*.parquet"))
             assert len(files_before) == 3  # 1 base + 2 deltas
 

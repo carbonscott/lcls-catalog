@@ -24,10 +24,13 @@ The `--workers` flag controls parallelism in two sequential phases:
 No conflict between phases - each executor is fully closed before next starts.
 """
 
+import glob
 import hashlib
 import os
 import re
 import shutil
+import sys
+import tempfile
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime
@@ -39,6 +42,47 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .catalog import DirSummary, FileEntry
+
+# Materialized state lives under <catalog>/_state/<kind>/, two levels below the
+# catalog root so the */*.parquet experiment globs never pick it up.
+STATE_DIR = "_state"
+
+# Columns of a deduplicated row, in schema order; on_disk is appended.
+COLUMNS = ("path, parent_path, filename, size, mtime, owner, group_name, "
+           "permissions, checksum, experiment, run, indexed_at")
+
+# on_disk for a row of a base or delta file: base rows carry on_disk, delta
+# rows carry status.
+ON_DISK_SQL = """CASE
+    WHEN on_disk IS NOT NULL THEN on_disk
+    WHEN status IS NOT NULL THEN status != 'removed'
+    ELSE true
+END"""
+
+# The newest row per path wins.
+LATEST_ROW_SQL = "QUALIFY ROW_NUMBER() OVER (PARTITION BY path ORDER BY indexed_at DESC) = 1"
+
+EMPTY_FILES_SQL = """SELECT NULL::VARCHAR AS path, NULL::VARCHAR AS parent_path,
+    NULL::VARCHAR AS filename, NULL::BIGINT AS size, NULL::BIGINT AS mtime,
+    NULL::VARCHAR AS owner, NULL::VARCHAR AS group_name, NULL::INTEGER AS permissions,
+    NULL::VARCHAR AS checksum, NULL::VARCHAR AS experiment, NULL::INTEGER AS run,
+    NULL::VARCHAR AS indexed_at, NULL::BOOLEAN AS on_disk
+WHERE false"""
+
+
+def _stem_ts(stem: str) -> str:
+    """Timestamp part of a base_/delta_ file stem; sorts snapshots in time."""
+    return stem.split("_", 1)[1]
+
+
+def _snapshot_inputs(exp_dir: Path) -> list[Path]:
+    """Base and delta files of one experiment, oldest first."""
+    files = [p for p in exp_dir.glob("*.parquet") if p.name.startswith(("base_", "delta_"))]
+    return sorted(files, key=lambda p: _stem_ts(p.stem))
+
+
+def _sql_list(paths) -> str:
+    return "[" + ", ".join(f"'{p}'" for p in paths) + "]"
 
 
 def _scan_directory(dirpath: str) -> tuple[list[str], list[str]]:
@@ -294,10 +338,18 @@ class ParquetCatalog:
 
         if not previous_state:
             # First run: create base snapshot
-            return self._write_base(exp_dir, timestamp, current_files)
+            result = self._write_base(exp_dir, timestamp, current_files)
+        else:
+            # Compute delta
+            result = self._write_delta(exp_dir, timestamp, current_files, previous_state)
 
-        # Compute delta
-        return self._write_delta(exp_dir, timestamp, current_files, previous_state)
+        # Runs even when nothing changed, so a missing current file heals itself.
+        try:
+            self.refresh_current(exp_dir)
+        except Exception as e:  # queries fall back to live dedup for this experiment
+            print(f"lcls-catalog: warning: could not refresh current state for "
+                  f"{exp_dir.name}: {e}", file=sys.stderr)
+        return result
 
     def _write_base(self, exp_dir: Path, timestamp: str, files: dict[str, dict]) -> tuple[int, int, int]:
         """Write a base snapshot file."""
@@ -397,102 +449,198 @@ class ParquetCatalog:
 
         return [r for r in results if r is not None]
 
+    def _exp_dirs(self) -> list[Path]:
+        """Experiment directories (skips _state and hidden dirs)."""
+        return sorted(p for p in self.catalog_dir.iterdir()
+                      if p.is_dir() and not p.name.startswith(("_", ".")))
+
     def _get_all_current_state(self) -> dict[str, dict]:
         """Load current state from all experiments."""
         all_state = {}
-        for exp_dir in self.catalog_dir.iterdir():
-            if exp_dir.is_dir():
-                state = self.load_current_state(exp_dir)
-                all_state.update(state)
+        for exp_dir in self._exp_dirs():
+            state = self.load_current_state(exp_dir)
+            all_state.update(state)
         return all_state
 
-    def _query_with_dedup(self, sql: str) -> list[tuple]:
-        """Execute SQL query with deduplication across base + deltas.
+    # --- Materialized current state -------------------------------------
+    #
+    # Deduplicating base + deltas at query time means sorting every row of
+    # every experiment that has a delta (195M rows / 83 GB peak RSS for one
+    # query in Oct 2026). Instead each experiment keeps one deduplicated file,
+    #   _state/current/<exp>__<stem of newest base/delta>.parquet
+    # whose name says which snapshot it is current as of. Queries read it
+    # directly and only dedup live for experiments whose file is missing or
+    # stale.
 
-        Optimization: Only run ROW_NUMBER() dedup on experiments that have
-        delta files. Experiments with only base files are read directly.
-        This reduces query time from ~37s to ~5s for typical workloads.
+    @property
+    def _current_dir(self) -> Path:
+        return self.catalog_dir / STATE_DIR / "current"
+
+    def _current_versions(self, exp: Optional[str] = None) -> dict[str, list[tuple[str, Path]]]:
+        """Materialized files per experiment as (source stem, path), oldest first."""
+        pattern = f"{glob.escape(exp)}__*.parquet" if exp else "*.parquet"
+        versions: dict[str, list[tuple[str, Path]]] = {}
+        if self._current_dir.is_dir():
+            for p in self._current_dir.glob(pattern):
+                name, _, source = p.stem.rpartition("__")
+                if name and source.startswith(("base_", "delta_")):
+                    versions.setdefault(name, []).append((source, p))
+        for v in versions.values():
+            v.sort(key=lambda sp: _stem_ts(sp[0]))
+        return versions
+
+    def refresh_current(
+        self, exp_dir: Path, memory_limit: str = "4GB", threads: int = 4
+    ) -> str:
+        """Bring one experiment's materialized current state up to date.
+
+        Applies a single new delta incrementally (memory ~ that delta);
+        otherwise rebuilds from all base/delta files.
+
+        Returns:
+            "fresh", "incremental", "full", or "empty".
         """
-        # Find which experiments have delta files (need dedup)
-        all_exps = set(p.parent.name for p in self.catalog_dir.glob("*/*.parquet"))
-        exps_with_deltas = set(
-            p.parent.name for p in self.catalog_dir.glob("*/delta_*.parquet")
-        )
-        exps_base_only = all_exps - exps_with_deltas
+        exp = exp_dir.name
+        inputs = _snapshot_inputs(exp_dir)
+        versions = self._current_versions(exp).get(exp, [])
 
-        # Column list for consistent SELECT
-        columns = """path, parent_path, filename, size, mtime, owner, group_name,
-                     permissions, checksum, experiment, run, indexed_at"""
+        if not inputs:
+            for _, p in versions:
+                p.unlink(missing_ok=True)
+            return "empty"
 
-        if not exps_with_deltas:
-            # Fast path: no deltas anywhere, skip dedup entirely
-            pattern = str(self.catalog_dir / "*" / "*.parquet")
-            simple_cte = f"""
-                WITH files AS (
-                    SELECT {columns}, COALESCE(on_disk, true) as on_disk
-                    FROM read_parquet('{pattern}', union_by_name=true)
-                )
-            """
-            return duckdb.execute(simple_cte + sql).fetchall()
+        newest = inputs[-1].stem
+        if versions and versions[-1][0] == newest:
+            return "fresh"
 
-        if not exps_base_only:
-            # All experiments have deltas, use original global dedup
-            pattern = str(self.catalog_dir / "*" / "*.parquet")
-            dedup_cte = f"""
-                WITH ranked AS (
-                    SELECT *,
-                        ROW_NUMBER() OVER (PARTITION BY path ORDER BY indexed_at DESC) as _rn
-                    FROM read_parquet('{pattern}', union_by_name=true)
-                ),
-                files AS (
-                    SELECT {columns},
-                           CASE
-                               WHEN on_disk IS NOT NULL THEN on_disk
-                               WHEN status IS NOT NULL THEN status != 'removed'
-                               ELSE true
-                           END as on_disk
-                    FROM ranked
-                    WHERE _rn = 1
-                )
-            """
-            return duckdb.execute(dedup_cte + sql).fetchall()
-
-        # Selective dedup: combine base-only (no dedup) + experiments with deltas (dedup)
-        base_only_patterns = [
-            str(self.catalog_dir / exp / "*.parquet") for exp in exps_base_only
-        ]
-        delta_exp_patterns = [
-            str(self.catalog_dir / exp / "*.parquet") for exp in exps_with_deltas
-        ]
-
-        selective_cte = f"""
-            WITH
-            base_only AS (
-                SELECT {columns}, COALESCE(on_disk, true) as on_disk
-                FROM read_parquet({base_only_patterns}, union_by_name=true)
-            ),
-            ranked AS (
-                SELECT *,
-                    ROW_NUMBER() OVER (PARTITION BY path ORDER BY indexed_at DESC) as _rn
-                FROM read_parquet({delta_exp_patterns}, union_by_name=true)
-            ),
-            deduped AS (
-                SELECT {columns},
-                       CASE
-                           WHEN on_disk IS NOT NULL THEN on_disk
-                           WHEN status IS NOT NULL THEN status != 'removed'
-                           ELSE true
-                       END as on_disk
-                FROM ranked
-                WHERE _rn = 1
-            ),
-            files AS (
-                SELECT * FROM base_only
+        prev = versions[-1] if versions else None
+        newer = [p for p in inputs if prev and _stem_ts(p.stem) > _stem_ts(prev[0])]
+        if prev and len(newer) == 1 and newer[0].name.startswith("delta_"):
+            mode = "incremental"
+            delta = newer[0]
+            select = f"""
+                SELECT o.* FROM read_parquet('{prev[1]}') o
+                    ANTI JOIN read_parquet('{delta}') d ON o.path = d.path
                 UNION ALL
-                SELECT * FROM deduped
-            )
+                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk FROM read_parquet('{delta}')"""
+        else:
+            mode = "full"
+            dedup = LATEST_ROW_SQL if len(inputs) > 1 else ""
+            select = f"""
+                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
+                FROM read_parquet({_sql_list(inputs)}, union_by_name=true)
+                {dedup}"""
+
+        self._current_dir.mkdir(parents=True, exist_ok=True)
+        dst = self._current_dir / f"{exp}__{newest}.parquet"
+        tmp = dst.with_name(dst.name + ".tmp")
+        self._copy_to_parquet(select, tmp, memory_limit, threads)
+        tmp.rename(dst)  # Atomic rename
+
+        # Keep the previous version: a query may have listed it a moment ago.
+        for _, p in versions[:-1]:
+            p.unlink(missing_ok=True)
+        return mode
+
+    def refresh_all(
+        self,
+        experiments: Optional[list[str]] = None,
+        memory_limit: str = "4GB",
+        threads: int = 4,
+    ) -> dict[str, list[str]]:
+        """Refresh materialized current state for all (or the named) experiments.
+
+        Returns:
+            Experiment names grouped by outcome ("fresh", "incremental",
+            "full", "empty", "failed").
         """
-        return duckdb.execute(selective_cte + sql).fetchall()
+        exp_dirs = self._exp_dirs()
+        if experiments:
+            wanted = set(experiments)
+            exp_dirs = [d for d in exp_dirs if d.name in wanted]
+        outcome: dict[str, list[str]] = {}
+        for exp_dir in exp_dirs:
+            try:
+                mode = self.refresh_current(exp_dir, memory_limit, threads)
+            except Exception as e:
+                print(f"lcls-catalog: refresh failed for {exp_dir.name}: {e}", file=sys.stderr)
+                mode = "failed"
+            outcome.setdefault(mode, []).append(exp_dir.name)
+
+        # Drop materialized files whose experiment directory is gone.
+        live = {d.name for d in self._exp_dirs()}
+        if not experiments:
+            for exp, versions in self._current_versions().items():
+                if exp not in live:
+                    for _, p in versions:
+                        p.unlink(missing_ok=True)
+        return outcome
+
+    @staticmethod
+    def _copy_to_parquet(select: str, dst: Path, memory_limit: str, threads: int):
+        """COPY a SELECT to a Parquet file under a memory cap.
+
+        DuckDB 1.4 sometimes runs out of memory just under a cap instead of
+        spilling, yet spills fine under a much smaller one (measured
+        2026-10-08: a dedup that failed at 4GB passed at 2GB, an anti-join
+        that failed at 2GB passed at 1GB). So on OOM, retry smaller.
+        """
+        for limit in dict.fromkeys([memory_limit, "2GB", "1GB"]):
+            spill = tempfile.mkdtemp(prefix="lcat-duckdb-")
+            con = duckdb.connect(config={
+                "memory_limit": limit,
+                "threads": threads,
+                "temp_directory": spill,
+                "preserve_insertion_order": False,
+            })
+            try:
+                con.execute("SET enable_progress_bar = false")  # keeps batch logs clean
+                con.execute(f"COPY ({select}) TO '{dst}' (FORMAT parquet)")
+                return
+            except duckdb.OutOfMemoryException:
+                if limit == "1GB":
+                    raise
+            finally:
+                con.close()
+                shutil.rmtree(spill, ignore_errors=True)
+
+    def _query_with_dedup(self, sql: str) -> list[tuple]:
+        """Execute SQL against `files`: the current state of every experiment.
+
+        Reads each experiment's materialized current file when it is fresh.
+        Otherwise falls back to the base files as-is (no deltas: nothing to
+        dedup) or to a live ROW_NUMBER() dedup over that experiment's files.
+        """
+        current = self._current_versions()
+        fresh, base_only, stale = [], [], []
+        for exp_dir in self._exp_dirs():
+            inputs = _snapshot_inputs(exp_dir)
+            if not inputs:
+                continue
+            versions = current.get(exp_dir.name)
+            if versions and versions[-1][0] == inputs[-1].stem:
+                fresh.append(versions[-1][1])
+            elif all(p.name.startswith("base_") for p in inputs):
+                base_only.extend(inputs)
+            else:
+                stale.extend(inputs)
+
+        parts = []
+        if fresh:
+            parts.append(f"""
+                SELECT {COLUMNS}, on_disk
+                FROM read_parquet({_sql_list(fresh)}, union_by_name=true)""")
+        if base_only:
+            parts.append(f"""
+                SELECT {COLUMNS}, COALESCE(on_disk, true) AS on_disk
+                FROM read_parquet({_sql_list(base_only)}, union_by_name=true)""")
+        if stale:
+            parts.append(f"""
+                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
+                FROM read_parquet({_sql_list(stale)}, union_by_name=true)
+                {LATEST_ROW_SQL}""")
+        files = " UNION ALL ".join(parts) if parts else EMPTY_FILES_SQL
+        return duckdb.execute(f"WITH files AS ({files})\n" + sql).fetchall()
 
     def ls(self, path: str, on_disk_only: bool = False) -> list[FileEntry]:
         """
@@ -710,29 +858,25 @@ class ParquetCatalog:
         stats = {"experiments": 0, "files_removed": 0, "files_archived": 0}
         timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S.%f")
 
-        for exp_dir in self.catalog_dir.iterdir():
-            if not exp_dir.is_dir():
-                continue
-
+        for exp_dir in self._exp_dirs():
             # Get all parquet files
             all_files = list(exp_dir.glob("*.parquet"))
             if len(all_files) <= 1:
                 continue  # Nothing to consolidate
 
-            # Reconstruct current state
-            state = self.load_current_state(exp_dir)
-            if not state:
+            # The materialized current state is exactly the new base; copying
+            # it keeps memory flat instead of one Python dict per row.
+            self.refresh_current(exp_dir)
+            current = self._current_versions(exp_dir.name).get(exp_dir.name)
+            if not current:
                 continue
 
-            # Write new base with all records
-            records = []
-            for rec in state.values():
-                rec["status"] = None  # Base files don't have status
-                records.append(rec)
             new_base = exp_dir / f"base_{timestamp}.parquet"
             temp_path = new_base.with_suffix('.parquet.tmp')
-            table = pa.Table.from_pylist(records, schema=self.SCHEMA)
-            pq.write_table(table, temp_path)
+            self._copy_to_parquet(
+                f"SELECT {COLUMNS}, on_disk, NULL::VARCHAR AS status "
+                f"FROM read_parquet('{current[-1][1]}')",
+                temp_path, memory_limit="4GB", threads=4)
             temp_path.rename(new_base)  # Atomic rename
 
             # Handle old files
@@ -749,6 +893,7 @@ class ParquetCatalog:
                     f.unlink()
                     stats["files_removed"] += 1
 
+            self.refresh_current(exp_dir)  # now a single base: a plain copy
             stats["experiments"] += 1
 
         return stats
@@ -765,7 +910,7 @@ class ParquetCatalog:
         """
         snapshots = []
 
-        dirs_to_scan = [self.catalog_dir / exp_hash] if exp_hash else self.catalog_dir.iterdir()
+        dirs_to_scan = [self.catalog_dir / exp_hash] if exp_hash else self._exp_dirs()
 
         for exp_dir in dirs_to_scan:
             if not exp_dir.is_dir():
@@ -775,9 +920,9 @@ class ParquetCatalog:
                 file_type = "base" if pq_file.name.startswith("base_") else "delta"
                 timestamp = pq_file.stem.split("_", 1)[1] if "_" in pq_file.stem else ""
 
-                # Get file stats
+                # Get file stats (row count from the footer, not the whole table)
                 stat = pq_file.stat()
-                table = pq.read_table(pq_file)
+                num_rows = pq.ParquetFile(pq_file).metadata.num_rows
 
                 snapshots.append({
                     "experiment": exp_dir.name,
@@ -785,7 +930,7 @@ class ParquetCatalog:
                     "timestamp": timestamp,
                     "file": str(pq_file),
                     "size_bytes": stat.st_size,
-                    "record_count": table.num_rows,
+                    "record_count": num_rows,
                 })
 
         return snapshots

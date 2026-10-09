@@ -32,7 +32,7 @@ export PSCONDA_SH=/sdf/group/lcls/ds/ana/sw/conda1/manage/bin/psconda.sh
 
 # Convenience wrapper for lcls-catalog commands
 # Usage: lcat <command> [args...]
-# - For read commands (query, find, ls, tree, stats, consolidate, snapshots):
+# - For catalog commands (query, find, ls, tree, stats, consolidate, snapshots, refresh):
 #   Automatically uses $CATALOG_DATA_DIR as the catalog directory
 # - For snapshot: Automatically adds -o $CATALOG_DATA_DIR
 lcat() {
@@ -43,7 +43,7 @@ lcat() {
     fi
     shift
     case "$cmd" in
-        query|find|ls|tree|stats|consolidate|snapshots)
+        query|find|ls|tree|stats|consolidate|snapshots|refresh)
             uv run --frozen --project "$LCLS_CATALOG_APP_DIR" lcls-catalog "$cmd" "$CATALOG_DATA_DIR" "$@"
             ;;
         snapshot)
