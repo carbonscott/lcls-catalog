@@ -174,3 +174,68 @@ class TestCurrentState:
         with ParquetCatalog(str(tmp_path / "cat")) as cat:
             assert cat.count() == 0
             assert cat.query("SELECT * FROM files") == []
+
+
+DIRS_SQL = """SELECT path, level, files, bytes, direct_files, direct_bytes
+              FROM dirs ORDER BY path"""
+
+
+def without_state(cat, kinds, sql):
+    """Query result with the given materialized kinds hidden (live fallback)."""
+    moved = []
+    try:
+        for kind in kinds:
+            src = cat.catalog_dir / "_state" / kind
+            if src.exists():
+                dst = cat.catalog_dir.parent / f"hidden-{kind}"
+                shutil.move(str(src), str(dst))
+                moved.append((dst, src))
+        return cat.query(sql)
+    finally:
+        for dst, src in moved:
+            shutil.move(str(dst), str(src))
+
+
+class TestDirs:
+
+    def test_recursive_totals(self, fake_experiment, tmp_path):
+        root = str(fake_experiment.experiment_path)
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            cat.snapshot(root, experiment="xpptest01")
+            got = {r[0][len(root):] or "/": r[1:] for r in cat.query(DIRS_SQL)}
+        assert got == {
+            "/": (0, 6, 4068, 0, 0),
+            "/calib": (1, 1, 128, 1, 128),
+            "/results": (1, 1, 256, 1, 256),
+            "/scratch": (1, 4, 3684, 0, 0),
+            "/scratch/run0001": (2, 3, 3172, 3, 3172),
+            "/scratch/run0002": (2, 1, 512, 1, 512),
+        }
+
+    def test_removed_files_do_not_count(self, fake_experiment, tmp_path):
+        exp_path = fake_experiment.experiment_path
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            cat.snapshot(str(exp_path), experiment="xpptest01")
+            (exp_path / "scratch" / "run0002" / "data.h5").unlink()
+            cat.snapshot(str(exp_path), experiment="xpptest01")
+            paths = {r[0][len(str(exp_path)):]: r[2:4] for r in cat.query(DIRS_SQL)}
+        assert "/scratch/run0002" not in paths
+        assert paths["/scratch"] == (3, 3172)
+
+    def test_materialized_matches_live_at_every_step(self, fake_experiment, tmp_path):
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            for step in history(cat, fake_experiment.experiment_path):
+                fresh = cat.query(DIRS_SQL)
+                assert fresh == without_state(cat, ["dirs"], DIRS_SQL), step
+                assert fresh == without_state(cat, ["dirs", "current"], DIRS_SQL), step
+
+    def test_files_and_dirs_together(self, fake_experiment, tmp_path):
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            cat.snapshot(str(fake_experiment.experiment_path), experiment="xpptest01")
+            rows = cat.query("""SELECT d.files, COUNT(*) FROM dirs d JOIN files f
+                                ON f.parent_path = d.path GROUP BY d.files ORDER BY 1""")
+        assert rows == [(1, 3), (3, 3)]
+
+    def test_empty_catalog_dirs(self, tmp_path):
+        with ParquetCatalog(str(tmp_path / "cat")) as cat:
+            assert cat.query("SELECT * FROM dirs") == []
