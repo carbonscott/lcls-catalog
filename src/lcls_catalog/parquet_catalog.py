@@ -31,8 +31,10 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
@@ -83,6 +85,43 @@ def _snapshot_inputs(exp_dir: Path) -> list[Path]:
 
 def _sql_list(paths) -> str:
     return "[" + ", ".join(f"'{p}'" for p in paths) + "]"
+
+
+class QueryLimitError(RuntimeError):
+    """A query hit lcat's memory or time limit. Retrying will not help."""
+
+
+LIMIT_ADVICE = """This is a hard limit, not a transient failure: retrying, running it in the
+background, or waiting longer will not help. Make the query smaller instead:
+  - filter early, e.g. WHERE experiment = '<exp>' or
+    WHERE parent_path LIKE '/sdf/data/lcls/ds/<hutch>/<exp>/%'
+  - aggregate to fewer groups (GROUP BY experiment, not GROUP BY path)
+  - add LIMIT when listing rows"""
+
+
+@dataclass
+class QueryLimits:
+    """Resource limits for read queries; they run on shared interactive nodes.
+
+    Each comes from an environment variable so a batch job can raise it.
+    """
+
+    memory_limit: str = "8GB"   # LCAT_MEMORY_LIMIT
+    threads: int = 8            # LCAT_THREADS
+    timeout: float = 90         # LCAT_TIMEOUT, seconds until the first rows; 0 = none
+    spill_dir: str = ""         # LCAT_SPILL_DIR, default $TMPDIR or /tmp
+    max_spill: str = "4GB"      # LCAT_MAX_SPILL
+
+    @classmethod
+    def from_env(cls) -> "QueryLimits":
+        env = os.environ.get
+        return cls(
+            memory_limit=env("LCAT_MEMORY_LIMIT", cls.memory_limit),
+            threads=int(env("LCAT_THREADS", min(cls.threads, os.cpu_count() or 1))),
+            timeout=float(env("LCAT_TIMEOUT", cls.timeout)),
+            spill_dir=env("LCAT_SPILL_DIR") or tempfile.gettempdir(),
+            max_spill=env("LCAT_MAX_SPILL", cls.max_spill),
+        )
 
 
 def _scan_directory(dirpath: str) -> tuple[list[str], list[str]]:
@@ -213,15 +252,17 @@ class ParquetCatalog:
         ("status", pa.string()),      # Set in delta files ("added"/"modified"/"removed"), NULL in base
     ])
 
-    def __init__(self, catalog_dir: str):
+    def __init__(self, catalog_dir: str, limits: Optional[QueryLimits] = None):
         """
         Initialize a Parquet catalog.
 
         Args:
             catalog_dir: Directory to store Parquet files.
+            limits: Resource limits for read queries (default: from LCAT_* env vars).
         """
         self.catalog_dir = Path(catalog_dir)
         self.catalog_dir.mkdir(parents=True, exist_ok=True)
+        self.limits = limits or QueryLimits.from_env()
 
     def _get_exp_dir(self, root: str, experiment: Optional[str] = None) -> Path:
         """Get directory for a specific experiment."""
@@ -605,7 +646,63 @@ class ParquetCatalog:
                 shutil.rmtree(spill, ignore_errors=True)
 
     def _query_with_dedup(self, sql: str) -> list[tuple]:
-        """Execute SQL against `files`: the current state of every experiment.
+        """Execute SQL against `files`: the current state of every experiment."""
+        return list(self._iter_query_with_dedup(sql))
+
+    def _iter_query_with_dedup(self, sql: str, batch_size: int = 10000) -> Iterator[tuple]:
+        """Run SQL against `files` under self.limits, yielding rows as they arrive.
+
+        The timeout covers execution until the first rows are ready; streaming
+        the rest (a long find listing, say) is not timed.
+
+        Raises:
+            QueryLimitError: the query hit the memory or time limit.
+        """
+        lim = self.limits
+        spill = tempfile.mkdtemp(prefix="lcat-duckdb-", dir=lim.spill_dir)
+        con = duckdb.connect(config={
+            "memory_limit": lim.memory_limit,
+            "threads": lim.threads,
+            "temp_directory": spill,
+            "max_temp_directory_size": lim.max_spill,
+            "preserve_insertion_order": False,
+        })
+        con.execute("SET enable_progress_bar = false")
+        timed_out = threading.Event()
+
+        def interrupt():
+            timed_out.set()
+            con.interrupt()
+
+        timer = threading.Timer(lim.timeout, interrupt) if lim.timeout > 0 else None
+        try:
+            try:
+                if timer:
+                    timer.start()
+                cursor = con.execute(f"WITH files AS ({self._files_sql()})\n" + sql)
+                batch = cursor.fetchmany(batch_size)
+            finally:
+                if timer:
+                    timer.cancel()
+            while batch:
+                yield from batch
+                batch = cursor.fetchmany(batch_size)
+        except duckdb.OutOfMemoryException as e:
+            raise QueryLimitError(
+                f"query stopped: it needed more than {lim.memory_limit} of memory "
+                f"(LCAT_MEMORY_LIMIT; spilling to disk is capped at {lim.max_spill}, "
+                f"LCAT_MAX_SPILL).\n{LIMIT_ADVICE}") from e
+        except duckdb.InterruptException as e:
+            if not timed_out.is_set():
+                raise
+            raise QueryLimitError(
+                f"query stopped after {lim.timeout:g}s (LCAT_TIMEOUT).\n{LIMIT_ADVICE}") from e
+        finally:
+            con.close()
+            shutil.rmtree(spill, ignore_errors=True)
+
+    def _files_sql(self) -> str:
+        """SELECT producing the current state of every experiment.
 
         Reads each experiment's materialized current file when it is fresh.
         Otherwise falls back to the base files as-is (no deltas: nothing to
@@ -639,8 +736,7 @@ class ParquetCatalog:
                 SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
                 FROM read_parquet({_sql_list(stale)}, union_by_name=true)
                 {LATEST_ROW_SQL}""")
-        files = " UNION ALL ".join(parts) if parts else EMPTY_FILES_SQL
-        return duckdb.execute(f"WITH files AS ({files})\n" + sql).fetchall()
+        return " UNION ALL ".join(parts) if parts else EMPTY_FILES_SQL
 
     def ls(self, path: str, on_disk_only: bool = False) -> list[FileEntry]:
         """
@@ -701,7 +797,11 @@ class ParquetCatalog:
         rows = self._query_with_dedup(sql)
         return [DirSummary(*row) for row in rows]
 
-    def find(
+    def find(self, pattern: str, **filters) -> list[FileEntry]:
+        """Search for files matching a pattern; see iter_find for arguments."""
+        return list(self.iter_find(pattern, **filters))
+
+    def iter_find(
         self,
         pattern: str,
         size_gt: Optional[int] = None,
@@ -711,9 +811,9 @@ class ParquetCatalog:
         on_disk_only: bool = False,
         removed_only: bool = False,
         skip_symlinks: bool = False,
-    ) -> list[FileEntry]:
+    ) -> Iterator[FileEntry]:
         """
-        Search for files matching a pattern.
+        Search for files matching a pattern, yielding entries as they arrive.
 
         Args:
             pattern: SQL LIKE pattern for path (e.g., "%.h5", "%mfx%").
@@ -725,8 +825,8 @@ class ParquetCatalog:
             removed_only: If True, only return files that have been removed.
             skip_symlinks: If True, exclude symbolic links from results.
 
-        Returns:
-            List of matching FileEntry objects.
+        Yields:
+            Matching FileEntry objects, ordered by path.
         """
         conditions = [f"path LIKE '{pattern}'"]
 
@@ -756,8 +856,8 @@ class ParquetCatalog:
             WHERE {where_clause}
             ORDER BY path
         """
-        rows = self._query_with_dedup(sql)
-        return [FileEntry(*row) for row in rows]
+        for row in self._iter_query_with_dedup(sql):
+            yield FileEntry(*row)
 
     def tree(self, path: str, depth: int = 2) -> str:
         """
@@ -844,6 +944,10 @@ class ParquetCatalog:
             List of result tuples.
         """
         return self._query_with_dedup(sql)
+
+    def iter_query(self, sql: str) -> Iterator[tuple]:
+        """Like query(), but yields rows as they arrive."""
+        return self._iter_query_with_dedup(sql)
 
     def consolidate(self, archive_dir: Optional[str] = None) -> dict[str, int]:
         """
