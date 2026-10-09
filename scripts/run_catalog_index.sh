@@ -151,6 +151,12 @@ export -f run_snapshot
 export OUTPUT_DIR LOG_FILE LCLS_CATALOG_APP_DIR DRY_RUN EXP_TIMEOUT
 
 # --- Main ---
+# Lines already in the log, so the end-of-run check reads only this run.
+LOG_START=0
+if [[ -f "$LOG_FILE" ]]; then
+    LOG_START=$(wc -l < "$LOG_FILE")
+fi
+
 log "=========================================="
 log "Starting LCLS catalog indexing"
 log "Output directory: $OUTPUT_DIR"
@@ -207,4 +213,13 @@ log "=========================================="
 if [[ "$DRY_RUN" != "true" ]]; then
     log "Final catalog statistics:"
     uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog stats "$OUTPUT_DIR" 2>&1 | tee -a "$LOG_FILE"
+fi
+
+# Any warning fails the run, so Slurm mails it (catalog_index.sbatch)
+# instead of it sitting unread in the log.
+warnings=$(tail -n +"$((LOG_START + 1))" "$LOG_FILE" \
+    | grep -cE 'Warning:|could not refresh current state' || true)
+if [[ $warnings -gt 0 ]]; then
+    log "Finished with $warnings warning line(s), see $LOG_FILE"
+    exit 1
 fi

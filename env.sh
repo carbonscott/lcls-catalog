@@ -26,6 +26,7 @@ fi
 # export CRON_NODE=sdfcron001           # Node where cron runs
 # export CRON_SCHEDULE="0 2 * * *"      # Schedule: daily at 2am
 # export CRON_LOG="$CATALOG_DATA_DIR/cron.log"
+# export CATALOG_ALERT_EMAIL=someone@slac.stanford.edu  # Failed-run mail (default: submitting user)
 
 # LCLS environment (provides sbatch in PATH for cron)
 export PSCONDA_SH=/sdf/group/lcls/ds/ana/sw/conda1/manage/bin/psconda.sh

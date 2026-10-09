@@ -17,6 +17,7 @@ The cron job on sdfcron001 submits a Slurm batch job to milano nodes where the a
 - Each snapshot streams its walk to a temporary Parquet file, diffs it against `_state/current` in DuckDB, writes a delta, and updates `_state/current` and `_state/dirs` for that experiment. Memory stays flat whatever the file count.
 - A snapshot running longer than 11h (`--exp-timeout`) is stopped and logged, so it shows up before the 12h Slurm limit ends the job.
 - Every experiment gets one line in `catalog_index.log` with its result, duration and thread count; failures and timeouts start with `Warning:`.
+- If any experiment failed, the run exits 1 so Slurm marks the job FAILED and mails it (see [Failure alerts](#failure-alerts)).
 
 ## Quick Reference
 
@@ -29,6 +30,7 @@ The cron job on sdfcron001 submits a Slurm batch job to milano nodes where the a
 | Time limit | 12 hours (11 per experiment) |
 | CPUs | 32 |
 | Memory | 128G |
+| Failure mail | Submitting user, or `$CATALOG_ALERT_EMAIL` |
 
 ## Managing the Cron Job
 
@@ -44,6 +46,23 @@ The cron job on sdfcron001 submits a Slurm batch job to milano nodes where the a
 
 # Manually submit a job now
 ./scripts/catalog-cron.sh submit
+```
+
+## Failure alerts
+
+`catalog_index.sbatch` sets `--mail-type=FAIL`, so Slurm sends one email when the nightly job:
+
+- logged a `Warning:` line (an experiment failed or timed out) or `could not refresh current state` (a snapshot could not update `_state/`). The job state is FAILED.
+- hit the 12h limit (TIMEOUT).
+- was killed for memory (OUT_OF_MEMORY).
+
+Mail goes to the user who submitted the job, which is the owner of the cron entry. To send it elsewhere, set `CATALOG_ALERT_EMAIL` in the deployment's `env.local`; `catalog-cron.sh submit` passes it to `sbatch --mail-user`.
+
+When the email arrives, start with the latest run's warnings:
+
+```bash
+LOG=$CATALOG_DATA_DIR/catalog_index.log
+sed -n "$(grep -n 'Starting LCLS catalog indexing' $LOG | tail -1 | cut -d: -f1),\$p" $LOG | grep -E 'Warning|could not refresh'
 ```
 
 ## Testing
@@ -95,6 +114,9 @@ Set in `env.sh`:
 ```bash
 # Check slurm job status
 squeue -u $USER -n catalog-index
+
+# Recent nightly runs: state, run time, peak memory
+sacct -u $USER --name catalog-index -S now-7days -o JobID,Start,Elapsed,State,MaxRSS
 
 # Watch slurm log
 tail -f $CATALOG_DATA_DIR/slurm_*.log

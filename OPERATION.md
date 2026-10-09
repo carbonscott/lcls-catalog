@@ -5,13 +5,15 @@
 Source the environment file before running lcls-catalog:
 
 ```bash
-source /sdf/scratch/users/c/cwang31/proj-lcls-catalog/env.sh
+source /sdf/group/lcls/ds/dm/apps/dev/tools/lcls-catalog/env.sh
 ```
+
+That directory is the deployed checkout of this repository, and the nightly job runs from it. Use it, or a checkout of the current `main`: older code writes deltas without updating `_state/`, which slows that experiment's queries until the next nightly run.
 
 This sets:
 - `LCLS_CATALOG_APP_DIR` - Path to the lcls-catalog project
-- `CATALOG_DATA_DIR` - Directory for catalog parquet files
-- `UV_CACHE_DIR` - Persistent uv cache location
+- `CATALOG_DATA_DIR` - Directory for catalog parquet files (the deployment's untracked `env.local` points it at the shared catalog)
+- `UV_CACHE_DIR` - uv cache location
 
 ## Running lcls-catalog
 
@@ -54,46 +56,39 @@ The wrapper automatically uses `$CATALOG_DATA_DIR` for read commands and adds `-
 
 ## Batch Indexing
 
-Index all LCLS experiments using the batch script:
+The nightly cron job indexes every experiment with `scripts/run_catalog_index.sh`; see [CRON.md](CRON.md) for the schedule, failure alerts and monitoring. To run the same script by hand:
 
 ```bash
-# Basic usage (requires -o flag)
-$LCLS_CATALOG_APP_DIR/examples/index_all_parquet.sh -o "$CATALOG_DATA_DIR"
+# Submit a Slurm job now, exactly as cron does
+scripts/catalog-cron.sh submit
 
-# With custom parallelism
-$LCLS_CATALOG_APP_DIR/examples/index_all_parquet.sh -o "$CATALOG_DATA_DIR" -p 64 -w 8
-
-# Index specific hutches only
-$LCLS_CATALOG_APP_DIR/examples/index_all_parquet.sh -o "$CATALOG_DATA_DIR" -H "cxi mfx"
+# One hutch, on the current machine, with a separate lock file
+scripts/catalog-cron.sh test --hutches "prj"
 ```
 
-### Batch script options
+### Indexer options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-o` | Output directory (required) | - |
-| `-p` | Max parallel experiments | 128 |
-| `-w` | Workers per experiment | 4 |
-| `-H` | Hutches to process | all |
+| `--hutches "..."` | Hutches to process | amo cxi mec mfx tmo ued rix xcs det mob prj |
+| `--parallel N` | Max concurrent experiments | 128 |
+| `--workers N` | Threads per experiment | 4 |
+| `--big-workers N` | Threads per experiment over 100 MB of current state | 16 |
+| `--exp-timeout D` | Stop one experiment after D (`timeout` syntax) | 11h |
+| `--dry-run` | Count files only, write nothing | off |
+| `--lock-file PATH` | Lock file | `/tmp/catalog_index.lock` |
 
-## Running on Slurm (Milano/Ada Nodes)
+The run exits 1 if any experiment logged a `Warning:` line.
 
-For large-scale indexing, use a Slurm allocation to get more CPUs.
+`examples/index_all_parquet.sh` is an older standalone version of this script; the nightly job does not use it.
 
-### Using a placeholder job
+## Running on Slurm (Milano Nodes)
 
-Submit a placeholder job that holds resources:
+`scripts/catalog_index.sbatch` is the nightly job itself: it runs the indexer, then ends. Submit it with `scripts/catalog-cron.sh submit` (above).
+
+To index inside an allocation you already hold:
 ```bash
-sbatch scripts/catalog_index.sbatch
-```
-
-Or use an existing hetjob allocation:
-```bash
-# Run on milano (het-group=0)
-srun --het-group=0 --jobid=<JOBID> bash -c "source env.sh && scripts/run_catalog_index.sh"
-
-# Run on ada (het-group=1)
-srun --het-group=1 --jobid=<JOBID> bash -c "source env.sh && scripts/run_catalog_index.sh"
+srun --jobid=<JOBID> --ntasks=1 --cpus-per-task=32 bash -c "source env.sh && scripts/run_catalog_index.sh --hutches prj"
 ```
 
 ### Killing a task WITHOUT releasing the allocation
@@ -121,21 +116,21 @@ squeue --me
 # Check your allocation
 squeue --me
 #     JOBID         NAME      STATE  NODES  NODELIST
-# 16893372+0  placeholder    RUNNING      1  sdfmilan238
+# 16893372        interactive  RUNNING      1  sdfmilan238
 
 # Run indexing on the allocated node
-srun --het-group=0 --jobid=16893372 bash -c "source env.sh && scripts/run_catalog_index.sh --hutches prj"
+srun --jobid=16893372 --ntasks=1 --cpus-per-task=32 bash -c "source env.sh && scripts/run_catalog_index.sh --hutches prj"
 
 # Oops, need to stop it (find PID first)
 ps aux | grep srun | grep $USER
-# cwang31  1678887  ... srun --het-group=0 ...
+# cwang31  1678887  ... srun --jobid=16893372 ...
 
 # Kill the task (allocation stays)
 kill 1678887
 
 # Allocation still there
 squeue --me
-# 16893372+0  placeholder    RUNNING  ...
+# 16893372        interactive  RUNNING  ...
 ```
 
 ## Directory Layout
@@ -146,6 +141,6 @@ $CATALOG_DATA_DIR/
 ├── _state/current/    # Deduplicated current state per experiment (what queries read)
 ├── _state/dirs/       # Recursive directory totals per experiment (the `dirs` table)
 ├── catalog_index.log  # Indexing log
-├── slurm_*.log        # Slurm job logs
-└── .uv-cache/         # UV package cache
+├── cron.log           # Output of the cron submissions
+└── slurm_*.log        # Slurm job logs
 ```
