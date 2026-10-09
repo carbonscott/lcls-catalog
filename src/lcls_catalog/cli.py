@@ -145,6 +145,22 @@ def cmd_consolidate(args):
                 print(f"  Removed {stats['files_removed']} old files")
 
 
+def cmd_refresh(args):
+    """Handle the refresh command."""
+    with ParquetCatalog(args.db) as cat:
+        outcome = cat.refresh_all(
+            experiments=args.experiment or None,
+            memory_limit=args.memory_limit,
+            threads=args.threads,
+        )
+    for mode in ("full", "incremental", "fresh", "empty", "failed"):
+        if outcome.get(mode):
+            print(f"{mode:12} {len(outcome[mode]):>5}")
+    if outcome.get("failed"):
+        print("failed: " + " ".join(outcome["failed"]))
+        sys.exit(1)
+
+
 def cmd_snapshots(args):
     """Handle the snapshots command."""
     with ParquetCatalog(args.db) as cat:
@@ -274,6 +290,24 @@ def main():
         "--archive", help="Archive old files to this directory instead of deleting"
     )
     consolidate_parser.set_defaults(func=cmd_consolidate)
+
+    # refresh command
+    refresh_parser = subparsers.add_parser(
+        "refresh",
+        help="Bring the deduplicated current-state files that queries read up to date",
+    )
+    refresh_parser.add_argument("db", help="Catalog directory")
+    refresh_parser.add_argument(
+        "-e", "--experiment", action="append", default=[],
+        help="Only this experiment (can be repeated)"
+    )
+    refresh_parser.add_argument(
+        "--memory-limit", default="4GB", help="DuckDB memory limit per rebuild (default: 4GB)"
+    )
+    refresh_parser.add_argument(
+        "--threads", type=int, default=4, help="DuckDB threads per rebuild (default: 4)"
+    )
+    refresh_parser.set_defaults(func=cmd_refresh)
 
     # snapshots command
     snapshots_parser = subparsers.add_parser(
