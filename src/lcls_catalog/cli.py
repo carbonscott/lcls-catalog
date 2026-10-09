@@ -1,9 +1,10 @@
 """Command-line interface for LCLS data catalog."""
 
 import argparse
+import os
 import sys
 
-from .parquet_catalog import ParquetCatalog
+from .parquet_catalog import ParquetCatalog, QueryLimitError
 
 
 def parse_size(size_str: str) -> int:
@@ -68,7 +69,7 @@ def cmd_find(args):
     size_lt = parse_size(args.size_lt) if args.size_lt else None
 
     with ParquetCatalog(args.db) as cat:
-        results = cat.find(
+        results = cat.iter_find(
             args.pattern,
             size_gt=size_gt,
             size_lt=size_lt,
@@ -78,13 +79,14 @@ def cmd_find(args):
             removed_only=args.removed,
             skip_symlinks=args.no_symlinks,
         )
-        if not results:
-            print(f"No files matching '{args.pattern}'")
-            return
+        found = False
         for f in results:
+            found = True
             size_str = f.size_human if args.human else str(f.size)
             status = "" if not args.show_status else ("\t[removed]" if hasattr(f, 'on_disk') and not f.on_disk else "")
             print(f"{f.path}\t{size_str}{status}")
+        if not found:
+            print(f"No files matching '{args.pattern}'")
 
 
 def cmd_tree(args):
@@ -122,12 +124,12 @@ def cmd_stats(args):
 def cmd_query(args):
     """Handle the query command."""
     with ParquetCatalog(args.db) as cat:
-        rows = cat.query(args.sql)
-        if not rows:
-            print("No results")
-            return
-        for row in rows:
+        found = False
+        for row in cat.iter_query(args.sql):
+            found = True
             print("\t".join(str(x) if x is not None else "" for x in row))
+        if not found:
+            print("No results")
 
 
 def cmd_consolidate(args):
@@ -320,7 +322,14 @@ def main():
     snapshots_parser.set_defaults(func=cmd_snapshots)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except QueryLimitError as e:
+        print(f"lcat: {e}", file=sys.stderr)
+        sys.exit(3)
+    except BrokenPipeError:  # e.g. piped into head
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
 
 
 if __name__ == "__main__":
