@@ -72,6 +72,70 @@ EMPTY_FILES_SQL = """SELECT NULL::VARCHAR AS path, NULL::VARCHAR AS parent_path,
 WHERE false"""
 
 
+EMPTY_DIRS_SQL = """SELECT NULL::VARCHAR AS experiment, NULL::VARCHAR AS path,
+    NULL::BIGINT AS depth, NULL::BIGINT AS level, NULL::BIGINT AS files,
+    NULL::BIGINT AS bytes, NULL::BIGINT AS direct_files, NULL::BIGINT AS direct_bytes,
+    NULL::BIGINT AS newest_mtime
+WHERE false"""
+
+
+def _dirs_select(files_rel: str) -> str:
+    """Per-directory totals of on-disk files, recursive within each experiment.
+
+    A file counts toward its parent directory and every ancestor down to the
+    experiment root (the path component equal to the experiment name, else the
+    experiment's shallowest directory). level is 0 at that root.
+    """
+    return f"""
+    WITH d AS (
+        SELECT experiment, string_split(parent_path, '/') AS parts,
+               SUM(size) AS bytes, COUNT(*) AS files, MAX(mtime) AS newest_mtime
+        FROM ({files_rel}) WHERE on_disk
+        GROUP BY experiment, parent_path
+    ), r AS (
+        SELECT *, COALESCE(list_position(parts, experiment),
+                           MIN(len(parts)) OVER (PARTITION BY experiment)) AS root_k
+        FROM d
+    ), a AS (
+        SELECT *, unnest(range(root_k, len(parts) + 1)) AS k FROM r
+    )
+    SELECT experiment,
+           array_to_string(parts[1:k], '/') AS path,
+           (k - 1)::BIGINT AS depth,
+           (k - root_k)::BIGINT AS level,
+           SUM(files)::BIGINT AS files,
+           SUM(bytes)::BIGINT AS bytes,
+           COALESCE(SUM(files) FILTER (WHERE k = len(parts)), 0)::BIGINT AS direct_files,
+           COALESCE(SUM(bytes) FILTER (WHERE k = len(parts)), 0)::BIGINT AS direct_bytes,
+           MAX(newest_mtime)::BIGINT AS newest_mtime
+    FROM a
+    GROUP BY ALL"""
+
+
+def _files_union(groups: dict[str, list[list[Path]]]) -> str:
+    """UNION ALL of current-state rows; groups maps kind -> per-experiment paths.
+
+    kind "current": materialized files, read as-is. "base_only": base files of
+    experiments without deltas, nothing to dedup. "stale": base + deltas,
+    deduplicated live.
+    """
+    parts = []
+    flat = {kind: [p for paths in exps for p in paths] for kind, exps in groups.items()}
+    if flat.get("current"):
+        parts.append(f"""
+            SELECT {COLUMNS}, on_disk
+            FROM read_parquet({_sql_list(flat["current"])}, union_by_name=true)""")
+    if flat.get("base_only"):
+        parts.append(f"""
+            SELECT {COLUMNS}, COALESCE(on_disk, true) AS on_disk
+            FROM read_parquet({_sql_list(flat["base_only"])}, union_by_name=true)""")
+    if flat.get("stale"):
+        parts.append(f"""
+            SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
+            FROM read_parquet({_sql_list(flat["stale"])}, union_by_name=true)
+            {LATEST_ROW_SQL}""")
+    return " UNION ALL ".join(parts)
+
 def _stem_ts(stem: str) -> str:
     """Timestamp part of a base_/delta_ file stem; sorts snapshots in time."""
     return stem.split("_", 1)[1]
@@ -503,26 +567,26 @@ class ParquetCatalog:
             all_state.update(state)
         return all_state
 
-    # --- Materialized current state -------------------------------------
+    # --- Materialized state ---------------------------------------------
     #
     # Deduplicating base + deltas at query time means sorting every row of
     # every experiment that has a delta (195M rows / 83 GB peak RSS for one
-    # query in Oct 2026). Instead each experiment keeps one deduplicated file,
-    #   _state/current/<exp>__<stem of newest base/delta>.parquet
-    # whose name says which snapshot it is current as of. Queries read it
-    # directly and only dedup live for experiments whose file is missing or
+    # query in Oct 2026). Instead each experiment keeps, per kind,
+    #   _state/current/<exp>__<stem of newest base/delta>.parquet  (deduplicated files)
+    #   _state/dirs/<exp>__<same stem>.parquet                       (recursive dir totals)
+    # whose name says which snapshot it is current as of. Queries read them
+    # directly and only compute live for experiments whose file is missing or
     # stale.
 
-    @property
-    def _current_dir(self) -> Path:
-        return self.catalog_dir / STATE_DIR / "current"
-
-    def _current_versions(self, exp: Optional[str] = None) -> dict[str, list[tuple[str, Path]]]:
-        """Materialized files per experiment as (source stem, path), oldest first."""
+    def _state_versions(
+        self, kind: str, exp: Optional[str] = None
+    ) -> dict[str, list[tuple[str, Path]]]:
+        """Materialized files of one kind per experiment as (source stem, path), oldest first."""
+        state_dir = self.catalog_dir / STATE_DIR / kind
         pattern = f"{glob.escape(exp)}__*.parquet" if exp else "*.parquet"
         versions: dict[str, list[tuple[str, Path]]] = {}
-        if self._current_dir.is_dir():
-            for p in self._current_dir.glob(pattern):
+        if state_dir.is_dir():
+            for p in state_dir.glob(pattern):
                 name, _, source = p.stem.rpartition("__")
                 if name and source.startswith(("base_", "delta_")):
                     versions.setdefault(name, []).append((source, p))
@@ -530,57 +594,73 @@ class ParquetCatalog:
             v.sort(key=lambda sp: _stem_ts(sp[0]))
         return versions
 
+    def _write_state(
+        self, kind: str, exp: str, source: str, select: str,
+        versions: list[tuple[str, Path]], memory_limit: str, threads: int,
+    ) -> Path:
+        """Write one materialized file atomically and prune old versions."""
+        state_dir = self.catalog_dir / STATE_DIR / kind
+        state_dir.mkdir(parents=True, exist_ok=True)
+        dst = state_dir / f"{exp}__{source}.parquet"
+        tmp = dst.with_name(dst.name + ".tmp")
+        self._copy_to_parquet(select, tmp, memory_limit, threads)
+        tmp.rename(dst)  # Atomic rename
+        # Keep the previous version: a query may have listed it a moment ago.
+        for _, p in versions[:-1]:
+            p.unlink(missing_ok=True)
+        return dst
+
     def refresh_current(
         self, exp_dir: Path, memory_limit: str = "4GB", threads: int = 4
     ) -> str:
-        """Bring one experiment's materialized current state up to date.
+        """Bring one experiment's materialized state (current, dirs) up to date.
 
         Applies a single new delta incrementally (memory ~ that delta);
-        otherwise rebuilds from all base/delta files.
+        otherwise rebuilds from all base/delta files. dirs is rebuilt from
+        the current file whenever it is behind.
 
         Returns:
-            "fresh", "incremental", "full", or "empty".
+            How the current file was brought up to date: "fresh",
+            "incremental", "full", or "empty".
         """
         exp = exp_dir.name
         inputs = _snapshot_inputs(exp_dir)
-        versions = self._current_versions(exp).get(exp, [])
+        versions = self._state_versions("current", exp).get(exp, [])
+        dirs_versions = self._state_versions("dirs", exp).get(exp, [])
 
         if not inputs:
-            for _, p in versions:
+            for _, p in versions + dirs_versions:
                 p.unlink(missing_ok=True)
             return "empty"
 
         newest = inputs[-1].stem
-        if versions and versions[-1][0] == newest:
-            return "fresh"
-
         prev = versions[-1] if versions else None
         newer = [p for p in inputs if prev and _stem_ts(p.stem) > _stem_ts(prev[0])]
-        if prev and len(newer) == 1 and newer[0].name.startswith("delta_"):
-            mode = "incremental"
-            delta = newer[0]
-            select = f"""
-                SELECT o.* FROM read_parquet('{prev[1]}') o
-                    ANTI JOIN read_parquet('{delta}') d ON o.path = d.path
-                UNION ALL
-                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk FROM read_parquet('{delta}')"""
+        if prev and prev[0] == newest:
+            mode, current = "fresh", prev[1]
         else:
-            mode = "full"
-            dedup = LATEST_ROW_SQL if len(inputs) > 1 else ""
-            select = f"""
-                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
-                FROM read_parquet({_sql_list(inputs)}, union_by_name=true)
-                {dedup}"""
+            if prev and len(newer) == 1 and newer[0].name.startswith("delta_"):
+                mode = "incremental"
+                delta = newer[0]
+                select = f"""
+                    SELECT o.* FROM read_parquet('{prev[1]}') o
+                        ANTI JOIN read_parquet('{delta}') d ON o.path = d.path
+                    UNION ALL
+                    SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk FROM read_parquet('{delta}')"""
+            else:
+                mode = "full"
+                dedup = LATEST_ROW_SQL if len(inputs) > 1 else ""
+                select = f"""
+                    SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
+                    FROM read_parquet({_sql_list(inputs)}, union_by_name=true)
+                    {dedup}"""
+            current = self._write_state(
+                "current", exp, newest, select, versions, memory_limit, threads)
 
-        self._current_dir.mkdir(parents=True, exist_ok=True)
-        dst = self._current_dir / f"{exp}__{newest}.parquet"
-        tmp = dst.with_name(dst.name + ".tmp")
-        self._copy_to_parquet(select, tmp, memory_limit, threads)
-        tmp.rename(dst)  # Atomic rename
-
-        # Keep the previous version: a query may have listed it a moment ago.
-        for _, p in versions[:-1]:
-            p.unlink(missing_ok=True)
+        if not (dirs_versions and dirs_versions[-1][0] == newest):
+            self._write_state(
+                "dirs", exp, newest, _dirs_select(f"SELECT * FROM read_parquet('{current}')"),
+                dirs_versions, memory_limit, threads)
         return mode
 
     def refresh_all(
@@ -589,7 +669,7 @@ class ParquetCatalog:
         memory_limit: str = "4GB",
         threads: int = 4,
     ) -> dict[str, list[str]]:
-        """Refresh materialized current state for all (or the named) experiments.
+        """Refresh materialized state for all (or the named) experiments.
 
         Returns:
             Experiment names grouped by outcome ("fresh", "incremental",
@@ -611,10 +691,11 @@ class ParquetCatalog:
         # Drop materialized files whose experiment directory is gone.
         live = {d.name for d in self._exp_dirs()}
         if not experiments:
-            for exp, versions in self._current_versions().items():
-                if exp not in live:
-                    for _, p in versions:
-                        p.unlink(missing_ok=True)
+            for kind in ("current", "dirs"):
+                for exp, versions in self._state_versions(kind).items():
+                    if exp not in live:
+                        for _, p in versions:
+                            p.unlink(missing_ok=True)
         return outcome
 
     @staticmethod
@@ -679,7 +760,8 @@ class ParquetCatalog:
             try:
                 if timer:
                     timer.start()
-                cursor = con.execute(f"WITH files AS ({self._files_sql()})\n" + sql)
+                with_dirs = re.search(r"\bdirs\b", sql, re.IGNORECASE) is not None
+                cursor = con.execute(f"WITH {self._tables_sql(with_dirs)}\n" + sql)
                 batch = cursor.fetchmany(batch_size)
             finally:
                 if timer:
@@ -701,42 +783,49 @@ class ParquetCatalog:
             con.close()
             shutil.rmtree(spill, ignore_errors=True)
 
-    def _files_sql(self) -> str:
-        """SELECT producing the current state of every experiment.
+    def _tables_sql(self, with_dirs: bool = False) -> str:
+        """CTE definitions for `files` (and `dirs`): current state of every experiment.
 
-        Reads each experiment's materialized current file when it is fresh.
+        Reads each experiment's materialized files when they are fresh.
         Otherwise falls back to the base files as-is (no deltas: nothing to
-        dedup) or to a live ROW_NUMBER() dedup over that experiment's files.
+        dedup) or to a live ROW_NUMBER() dedup over that experiment's files,
+        and computes that experiment's dirs rows live.
         """
-        current = self._current_versions()
-        fresh, base_only, stale = [], [], []
+        current = self._state_versions("current")
+        dirs = self._state_versions("dirs") if with_dirs else {}
+        groups: dict[str, list[list[Path]]] = {  # kind -> [paths of one experiment]
+            "current": [], "base_only": [], "stale": []}
+        fresh_dirs: list[Path] = []
+        live_dirs: dict[str, list[list[Path]]] = {k: [] for k in groups}
         for exp_dir in self._exp_dirs():
             inputs = _snapshot_inputs(exp_dir)
             if not inputs:
                 continue
+            newest = inputs[-1].stem
             versions = current.get(exp_dir.name)
-            if versions and versions[-1][0] == inputs[-1].stem:
-                fresh.append(versions[-1][1])
+            if versions and versions[-1][0] == newest:
+                kind, paths = "current", [versions[-1][1]]
             elif all(p.name.startswith("base_") for p in inputs):
-                base_only.extend(inputs)
+                kind, paths = "base_only", inputs
             else:
-                stale.extend(inputs)
+                kind, paths = "stale", inputs
+            groups[kind].append(paths)
+            d = dirs.get(exp_dir.name)
+            if d and d[-1][0] == newest:
+                fresh_dirs.append(d[-1][1])
+            elif with_dirs:
+                live_dirs[kind].append(paths)
 
-        parts = []
-        if fresh:
-            parts.append(f"""
-                SELECT {COLUMNS}, on_disk
-                FROM read_parquet({_sql_list(fresh)}, union_by_name=true)""")
-        if base_only:
-            parts.append(f"""
-                SELECT {COLUMNS}, COALESCE(on_disk, true) AS on_disk
-                FROM read_parquet({_sql_list(base_only)}, union_by_name=true)""")
-        if stale:
-            parts.append(f"""
-                SELECT {COLUMNS}, {ON_DISK_SQL} AS on_disk
-                FROM read_parquet({_sql_list(stale)}, union_by_name=true)
-                {LATEST_ROW_SQL}""")
-        return " UNION ALL ".join(parts) if parts else EMPTY_FILES_SQL
+        sql = f"files AS ({_files_union(groups) or EMPTY_FILES_SQL})"
+        if with_dirs:
+            parts = []
+            if fresh_dirs:
+                parts.append(f"SELECT * FROM read_parquet({_sql_list(fresh_dirs)}, union_by_name=true)")
+            live = _files_union(live_dirs)
+            if live:
+                parts.append(_dirs_select(live))
+            sql += f",\ndirs AS ({' UNION ALL '.join(parts) or EMPTY_DIRS_SQL})"
+        return sql
 
     def ls(self, path: str, on_disk_only: bool = False) -> list[FileEntry]:
         """
@@ -971,7 +1060,7 @@ class ParquetCatalog:
             # The materialized current state is exactly the new base; copying
             # it keeps memory flat instead of one Python dict per row.
             self.refresh_current(exp_dir)
-            current = self._current_versions(exp_dir.name).get(exp_dir.name)
+            current = self._state_versions("current", exp_dir.name).get(exp_dir.name)
             if not current:
                 continue
 

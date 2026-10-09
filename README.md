@@ -11,9 +11,13 @@ source ./env.sh
 lcat stats                       # Show catalog statistics
 lcat find "%.h5" -H              # Find HDF5 files
 lcat find "%.h5" --size-gt 1GB   # Find large files
-lcat query "SELECT ..."          # Run SQL query
+lcat query "SELECT ..."          # Run SQL query (tables: files, dirs)
 lcat snapshot /path -e exp       # Create snapshot
+lcat refresh                     # Rebuild materialized state if behind
 ```
+
+Queries are capped at 8GB of memory, 8 threads and 90 s by default
+(`LCAT_MEMORY_LIMIT`, `LCAT_THREADS`, `LCAT_TIMEOUT`); see SKILLS.md.
 
 **Tip:** Add to your `~/.bashrc` for persistent access:
 ```bash

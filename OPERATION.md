@@ -142,7 +142,9 @@ squeue --me
 
 ```
 $CATALOG_DATA_DIR/
-├── *.parquet          # Catalog snapshot files
+├── <exp>/base_*.parquet, delta_*.parquet  # Catalog snapshot files
+├── _state/current/    # Deduplicated current state per experiment (what queries read)
+├── _state/dirs/       # Recursive directory totals per experiment (the `dirs` table)
 ├── catalog_index.log  # Indexing log
 ├── slurm_*.log        # Slurm job logs
 └── .uv-cache/         # UV package cache
