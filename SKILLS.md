@@ -86,7 +86,7 @@ After sourcing `env.sh`, you can use the `lcat` function for simpler commands:
 | `uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query "$CATALOG_DATA_DIR" "SELECT..."` | `lcat query "SELECT..."` |
 
 The `lcat` wrapper automatically:
-- Uses `$CATALOG_DATA_DIR` for read commands (find, query, ls, stats, tree, consolidate, snapshots)
+- Uses `$CATALOG_DATA_DIR` for catalog commands (find, query, ls, stats, tree, consolidate, snapshots, refresh)
 - Adds `-o $CATALOG_DATA_DIR` for snapshot commands
 
 ---
@@ -298,7 +298,10 @@ Total size indexed:   45.2 TB
 
 ### 6. query - Run SQL queries
 
-Execute raw SQL queries against the catalog. The table name is `files`.
+Execute raw SQL queries against the catalog. Two tables are available:
+`files` (one row per file) and `dirs` (one row per directory, with recursive
+totals). Use `dirs` for any "largest/biggest folder" question; it is
+precomputed and answers in well under a second.
 
 **Syntax:**
 ```bash
@@ -313,6 +316,28 @@ lcls-catalog query <catalog_dir> "<sql>"
 - `experiment`, `run`
 - `on_disk` (boolean)
 - `indexed_at`
+
+**`dirs` columns** (files currently on disk only):
+- `experiment`, `path` (the directory)
+- `depth` (number of path components), `level` (0 = experiment root, 1 = `xtc/`, `hdf5/`, ...)
+- `files`, `bytes`: recursive totals, everything under the directory
+- `direct_files`, `direct_bytes`: files directly in the directory
+- `newest_mtime` (Unix epoch seconds)
+
+**Resource limits.** Queries run with a memory cap, a thread cap and a time
+limit so one query cannot take over a shared interactive node:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LCAT_MEMORY_LIMIT` | `8GB` | DuckDB memory limit |
+| `LCAT_THREADS` | `8` | DuckDB threads |
+| `LCAT_TIMEOUT` | `90` | seconds until the first rows are ready; `0` = no limit |
+| `LCAT_MAX_SPILL` | `4GB` | disk spill cap, under `LCAT_SPILL_DIR` (default `$TMPDIR` or `/tmp`) |
+
+A query that hits a limit stops with `lcat: query stopped: ...` on stderr and
+exit code 3. That is final: make the query smaller (filter by experiment or
+path prefix, aggregate to fewer groups, use `dirs`, add `LIMIT`) rather than
+retrying. Batch jobs on a compute node may raise the limits.
 
 **Tip: Querying by date**
 
@@ -345,13 +370,23 @@ uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
 uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
   "$CATALOG_DATA_DIR" \
   "SELECT path, size/1e9 as gb FROM files ORDER BY size DESC LIMIT 20"
+
+# Ten largest xtc folders
+lcat query "SELECT path, bytes/1e12 AS tb, files FROM dirs
+            WHERE path LIKE '%/xtc' ORDER BY bytes DESC LIMIT 10"
+
+# Top-level folders of one experiment, largest first
+lcat query "SELECT path, bytes/1e12 AS tb FROM dirs
+            WHERE experiment = 'mfx101591026' AND level = 1 ORDER BY bytes DESC"
 ```
 
 ---
 
 ### 7. consolidate - Merge snapshots
 
-Merge base and delta snapshot files into new consolidated base files. Run this periodically to reduce the number of parquet files.
+Merge base and delta snapshot files into new consolidated base files. This
+reduces the number of parquet files but drops the history the deltas hold.
+Queries do not need it: they read the materialized state (see `refresh`).
 
 **Syntax:**
 ```bash
@@ -413,6 +448,22 @@ cxi12345/
 
 mfx67890/
   base  2024-06-02T09:15:00    23456 records      2345.6 KB
+```
+
+---
+
+### 9. refresh - Update the materialized state
+
+Each experiment keeps a deduplicated copy of its current state and a table of
+directory totals under `$CATALOG_DATA_DIR/_state/`. `snapshot` updates them
+automatically; `refresh` brings any that are missing or behind up to date
+(after an upgrade, or if a snapshot's refresh failed). Queries still give
+correct answers for experiments that are behind; they are just slower.
+
+```bash
+lcat refresh                       # all experiments
+lcat refresh -e mfx101591026       # one experiment
+lcat refresh --memory-limit 16GB   # more memory per rebuild (batch nodes)
 ```
 
 ---
@@ -521,15 +572,23 @@ uv run --project "$LCLS_CATALOG_APP_DIR" lcls-catalog query \
 
 When you run `consolidate`, base + deltas are merged into a new base file.
 
+Queries never read base + deltas directly when they can avoid it. After every
+snapshot the experiment's state is materialized under `_state/`:
+`_state/current/<exp>__<newest snapshot>.parquet` (one row per path, latest
+version) and `_state/dirs/<exp>__<newest snapshot>.parquet` (directory totals).
+The file name records which snapshot it reflects, so a stale file is detected
+by name and that experiment falls back to deduplicating live.
+
 ### Common issues
 
 **"No files matching pattern"**
 - Check your pattern syntax - use `%` not `*` as wildcard
 - Make sure the catalog has been populated with `snapshot` first
 
-**Slow queries**
-- Run `consolidate` to merge delta files if you have many
-- Check if you're querying a very large catalog
+**Slow queries, or `lcat: query stopped`**
+- Use the `dirs` table for folder sizes instead of aggregating `files`
+- Filter early (`WHERE experiment = ...` or a `parent_path LIKE '/sdf/.../%'` prefix)
+- Run `lcat refresh` if the materialized state is behind (snapshot errors)
 
 **Environment not set**
 ```
