@@ -52,8 +52,9 @@ Test/Submit options:
 
 Environment variables:
   CRON_NODE           Cron node (default: sdfcron001)
-  CRON_SCHEDULE       Cron schedule (default: 0 2 * * *)
+  CRON_SCHEDULE       Cron schedule (default: 0 1 * * *)
   CRON_LOG            Log file path (default: \$CATALOG_DATA_DIR/cron.log)
+  CATALOG_ALERT_EMAIL Where Slurm mails failed runs (default: the submitting user)
 
 Examples:
   # Check if cron is enabled and view running jobs
@@ -163,7 +164,13 @@ cmd_submit() {
     # Add slurm to PATH (cron has minimal PATH that doesn't include slurm)
     export PATH="/opt/slurm/slurm-curr/bin:$PATH"
 
-    job_id=$(sbatch --parsable --output="$CATALOG_DATA_DIR/slurm_%j.log" "$SCRIPT_DIR/catalog_index.sbatch" "$@")
+    # Slurm mails failures to the submitting user unless this names others.
+    local mail=()
+    if [[ -n "${CATALOG_ALERT_EMAIL:-}" ]]; then
+        mail=(--mail-user="$CATALOG_ALERT_EMAIL")
+    fi
+
+    job_id=$(sbatch --parsable "${mail[@]}" --output="$CATALOG_DATA_DIR/slurm_%j.log" "$SCRIPT_DIR/catalog_index.sbatch" "$@")
     echo "Submitted job: $job_id"
     echo "Monitor with: squeue -j $job_id"
     echo "Log file: ${CATALOG_DATA_DIR}/slurm_${job_id}.log"

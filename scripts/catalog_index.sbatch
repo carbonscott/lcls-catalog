@@ -4,10 +4,14 @@
 #SBATCH --account=lcls:prjdat21
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=32
-# Reserve memory: milano has no per-CPU default, and unreserved memory let
-# the node's OOM killer take snapshots (Sep-Oct 2026).
+# The streaming snapshot peaked at 26 GB on 2026-10-09. The old code was
+# OOM-killed at the 125G that milano gave it by default.
 #SBATCH --mem=128G
 #SBATCH --output=slurm_%j.log
+# Mail the submitting user (or $CATALOG_ALERT_EMAIL, see catalog-cron.sh)
+# when the job fails, times out or runs out of memory. Any Warning: line in
+# catalog_index.log makes run_catalog_index.sh fail the job.
+#SBATCH --mail-type=FAIL
 
 # LCLS Catalog Indexing - Slurm Batch Job
 #
@@ -30,7 +34,9 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "CPUs: $SLURM_CPUS_PER_TASK"
 echo "Arguments: $*"
 
-# Run the indexer with any passed arguments
-"$PROJECT_DIR/scripts/run_catalog_index.sh" "$@"
+# Run the indexer with any passed arguments; its exit code is the job's
+rc=0
+"$PROJECT_DIR/scripts/run_catalog_index.sh" "$@" || rc=$?
 
-echo "Job complete"
+echo "Job complete (exit $rc)"
+exit $rc
